@@ -1,0 +1,9 @@
+ollama
+playwright
+playwright-stealth
+httpx
+beautifulsoup4
+gspread
+oauth2client
+python-dotenv
+rapidfuzz
