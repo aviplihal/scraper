@@ -3,7 +3,9 @@ playwright
 playwright-stealth
 httpx
 beautifulsoup4
-gspread
-oauth2client
 python-dotenv
 rapidfuzz
+
+# Uncomment to re-enable Google Sheets storage:
+# gspread
+# oauth2client

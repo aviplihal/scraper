@@ -5,7 +5,6 @@
   "area": "San Francisco Bay Area",
   "website": "NA",
   "sources": ["web", "human_emulator"],
-  "sheet_id": "YOUR_GOOGLE_SHEET_ID_HERE",
   "fields": {
     "name": "Full name of the person",
     "job_title": "Current job title or role",

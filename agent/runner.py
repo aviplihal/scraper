@@ -9,7 +9,9 @@ import logging
 from agent.loop import run_agent_loop
 from human_emulator.browser import EmulatorBrowser
 from human_emulator.state import EmulatorState
-from sheets.writer import SheetsWriter
+from storage.writer import StorageWriter
+# To switch back to Google Sheets, replace the line above with:
+#   from sheets.writer import SheetsWriter
 from tools.browser import ScraperBrowser
 from tools.registry import ToolContext
 
@@ -19,17 +21,18 @@ logger = logging.getLogger(__name__)
 async def run_job(config: dict, source: str) -> None:
     """Entry point called by run_job.py."""
     client_id = config["client_id"]
-    sheet_id  = config["sheet_id"]
 
-    sheets_writer = SheetsWriter(sheet_id)
+    writer = StorageWriter(client_id)
+    # To switch back to Google Sheets, replace the line above with:
+    #   writer = SheetsWriter(config["sheet_id"])
 
     if source in ("web", "all"):
-        await _run_web(config, source, sheets_writer)
+        await _run_web(config, source, writer)
     elif source == "human_emulator":
-        await _run_emulator(config, sheets_writer)
+        await _run_emulator(config, writer)
 
 
-async def _run_web(config: dict, source: str, sheets_writer: SheetsWriter) -> None:
+async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
     """Run the agent with the web-scraper browser active."""
     client_id = config["client_id"]
     scraper   = ScraperBrowser()
@@ -45,7 +48,7 @@ async def _run_web(config: dict, source: str, sheets_writer: SheetsWriter) -> No
 
     ctx = ToolContext(
         client_config    = config,
-        sheets_writer    = sheets_writer,
+        sheets_writer    = writer,
         scraper_browser  = scraper,
         emulator_browser = emulator_browser,
         emulator_state   = emulator_state,
@@ -59,7 +62,7 @@ async def _run_web(config: dict, source: str, sheets_writer: SheetsWriter) -> No
             await emulator_browser.close()
 
 
-async def _run_emulator(config: dict, sheets_writer: SheetsWriter) -> None:
+async def _run_emulator(config: dict, writer: StorageWriter) -> None:
     """Run a human-emulator-only job: process queued social-media profiles."""
     client_id        = config["client_id"]
     emulator_browser = EmulatorBrowser(client_id)
@@ -68,7 +71,7 @@ async def _run_emulator(config: dict, sheets_writer: SheetsWriter) -> None:
 
     ctx = ToolContext(
         client_config    = config,
-        sheets_writer    = sheets_writer,
+        sheets_writer    = writer,
         emulator_browser = emulator_browser,
         emulator_state   = emulator_state,
     )
