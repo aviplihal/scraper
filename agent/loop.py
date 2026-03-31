@@ -17,11 +17,11 @@ from tools.registry import TOOL_DEFINITIONS, ToolContext, dispatch_tool
 
 logger = logging.getLogger(__name__)
 
-MODEL      = "qwen3:9b"
+MODEL      = "qwen3.5:9b"
 MAX_STEPS  = 30
 
 
-async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> None:
+async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
     """Run the agent until it finishes or hits MAX_STEPS."""
     messages: list[dict] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -29,12 +29,21 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> None:
     ]
 
     client = ollama.AsyncClient()
+    run_result = {
+        "steps_run": 0,
+        "status": "unknown",
+        "stop_reason": "",
+    }
 
-    print(f"\n[agent] Starting job — client={config['client_id']}  source={source}  model={MODEL}")
-    print(f"[agent] Job: {config['job']}")
-    print(f"[agent] Max steps: {MAX_STEPS}\n")
+    print("\n=== Job Start ===")
+    print(f"Client    : {config['client_id']}")
+    print(f"Source    : {source}")
+    print(f"Model     : {MODEL}")
+    print(f"Job       : {config['job']}")
+    print(f"Max steps : {MAX_STEPS}\n")
 
     for step in range(1, MAX_STEPS + 1):
+        run_result["steps_run"] = step
         logger.debug("Step %d / %d", step, MAX_STEPS)
 
         try:
@@ -47,6 +56,8 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> None:
         except Exception as exc:
             logger.error("Ollama call failed at step %d: %s", step, exc)
             print(f"[agent] ERROR: Ollama call failed — {exc}")
+            run_result["status"] = "error"
+            run_result["stop_reason"] = f"Ollama call failed: {exc}"
             break
 
         message = response.message
@@ -60,6 +71,8 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> None:
 
         if not message.tool_calls:
             print(f"\n[agent] Agent finished after {step} step(s) — no further tool calls.")
+            run_result["status"] = "completed"
+            run_result["stop_reason"] = "Agent stopped making tool calls."
             break
 
         # Execute tool calls and append results
@@ -91,9 +104,14 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> None:
 
     else:
         print(f"\n[agent] MAX_STEPS ({MAX_STEPS}) reached — job stopped.")
+        run_result["status"] = "max_steps"
+        run_result["stop_reason"] = f"Reached max step limit ({MAX_STEPS})."
 
-    if ctx._logged_sites_chosen:
-        print(f"\n[agent] Sites chosen by agent (website=NA): {ctx._logged_sites_chosen}")
+    if run_result["status"] == "unknown":
+        run_result["status"] = "completed"
+        run_result["stop_reason"] = "Run exited without an explicit stop reason."
+
+    return run_result
 
 
 def _fmt_args(args: dict) -> str:

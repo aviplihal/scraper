@@ -47,6 +47,9 @@ class StorageWriter:
         db_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = db_dir / "leads.db"
         self._lock = asyncio.Lock()
+        self.saved_count = 0
+        self.duplicate_count = 0
+        self.saved_rows: list[dict] = []
         self._init_db()
 
     def _init_db(self) -> None:
@@ -60,12 +63,12 @@ class StorageWriter:
         source_url: str,
         data: dict,
         scrape_status: str = "ok",
-    ) -> None:
-        """Append a lead row. Skips silently if source_url already exists."""
+    ) -> str:
+        """Append a lead row and return ``saved`` or ``duplicate``."""
         async with self._lock:
-            await asyncio.to_thread(self._insert, source_url, data, scrape_status)
+            return await asyncio.to_thread(self._insert, source_url, data, scrape_status)
 
-    def _insert(self, source_url: str, data: dict, scrape_status: str) -> None:
+    def _insert(self, source_url: str, data: dict, scrape_status: str) -> str:
         row = (
             data.get("name"),
             data.get("job_title"),
@@ -79,7 +82,7 @@ class StorageWriter:
         )
         try:
             with sqlite3.connect(self.db_path) as conn:
-                conn.execute(
+                cursor = conn.execute(
                     """INSERT OR IGNORE INTO leads
                        (name, job_title, company, email, phone, social_media,
                         source_url, scrape_status, scraped_at)
@@ -87,6 +90,23 @@ class StorageWriter:
                     row,
                 )
                 conn.commit()
+            if cursor.rowcount == 0:
+                self.duplicate_count += 1
+                logger.info("Skipped duplicate lead: %s", source_url)
+                return "duplicate"
+
+            self.saved_count += 1
+            self.saved_rows.append(
+                {
+                    "name": data.get("name"),
+                    "job_title": data.get("job_title"),
+                    "company": data.get("company"),
+                    "source_url": source_url,
+                    "scrape_status": scrape_status,
+                }
+            )
             logger.info("Saved lead: %s", source_url)
+            return "saved"
         except Exception as exc:
             logger.error("DB write failed for %s: %s", source_url, exc)
+            raise

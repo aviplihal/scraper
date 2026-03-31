@@ -47,6 +47,10 @@ class ToolContext:
     page_cache:      dict[str, str]  = field(default_factory=dict)   # fetch_id → HTML
     failed_url_flag: bool            = False          # set by fail_url to break the step loop
     _logged_sites_chosen: list[str]  = field(default_factory=list)   # for website=NA logging
+    fetch_count:     int             = 0
+    fetch_error_count: int           = 0
+    tool_call_count: int             = 0
+    failed_urls:     list[dict[str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +179,7 @@ TOOL_DEFINITIONS = [
 
 async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> dict[str, Any]:
     """Route a tool call to the appropriate handler and return its result."""
+    ctx.tool_call_count += 1
     if tool_name == "fetch_page":
         return await _tool_fetch_page(arguments["url"], arguments["needs_javascript"], ctx)
     elif tool_name == "parse_html":
@@ -193,9 +198,13 @@ async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> di
 
 async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -> dict:
     logger.info("fetch_page: %s (js=%s)", url, needs_javascript)
+    ctx.fetch_count += 1
 
     if _is_social_media(url):
-        return await _fetch_social_media(url, ctx)
+        result = await _fetch_social_media(url, ctx)
+        if "error" in result:
+            ctx.fetch_error_count += 1
+        return result
 
     # Log site if website=NA (agent chose this target itself)
     if ctx.client_config.get("website", "NA").upper() == "NA":
@@ -211,6 +220,7 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
         )
     except Exception as exc:
         logger.warning("fetch_page error for %s: %s", url, exc)
+        ctx.fetch_error_count += 1
         return {"error": str(exc), "url": url}
 
     fetch_id = str(uuid.uuid4())
@@ -271,9 +281,12 @@ def _tool_parse_html(fetch_id: str, fields: dict[str, str], ctx: ToolContext) ->
 
 async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
     try:
-        await ctx.sheets_writer.append_row(url, data)
-        print(f"  ✓ Saved: {data.get('name') or url}", flush=True)
-        return {"status": "saved", "url": url}
+        status = await ctx.sheets_writer.append_row(url, data)
+        if status == "saved":
+            print(f"  ✓ Saved: {data.get('name') or url}", flush=True)
+        else:
+            print(f"  • Duplicate skipped: {data.get('name') or url}", flush=True)
+        return {"status": status, "url": url}
     except Exception as exc:
         logger.error("save_result failed for %s: %s", url, exc)
         return {"error": str(exc), "url": url}
@@ -282,4 +295,5 @@ async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
 def _tool_fail_url(url: str, reason: str, ctx: ToolContext) -> dict:
     logger.info("fail_url: %s — %s", url, reason)
     ctx.failed_url_flag = True
+    ctx.failed_urls.append({"url": url, "reason": reason})
     return {"status": "failed", "url": url, "reason": reason}

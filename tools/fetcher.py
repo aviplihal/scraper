@@ -9,6 +9,7 @@ Rules:
 """
 
 import logging
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -43,13 +44,21 @@ async def smart_fetch(
     Returns:
         HTML string of the page.
     """
+    if _should_force_browser(url):
+        logger.debug("smart_fetch: forcing Playwright for %s", url)
+        return await _fetch_playwright(url, get_context)
+
     if not needs_javascript:
         html = await _fetch_httpx(url)
-        if html and _visible_text_length(html) >= _MIN_TEXT_LENGTH:
+        if (
+            html
+            and _visible_text_length(html) >= _MIN_TEXT_LENGTH
+            and not _looks_like_client_shell(url, html)
+        ):
             logger.debug("smart_fetch: httpx succeeded for %s", url)
             return html
         logger.debug(
-            "smart_fetch: httpx result too short (%d chars text) — falling back to Playwright for %s",
+            "smart_fetch: httpx result unusable (%d chars text) — falling back to Playwright for %s",
             _visible_text_length(html) if html else 0,
             url,
         )
@@ -78,6 +87,7 @@ async def _fetch_playwright(url: str, get_context) -> str:
     page = await ctx.new_page()
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        await _wait_for_page_content(page, url)
         html = await page.content()
         return html
     finally:
@@ -92,3 +102,68 @@ def _visible_text_length(html: str) -> int:
         return len(soup.get_text())
     except Exception:
         return 0
+
+
+def _should_force_browser(url: str) -> bool:
+    """Return True for URLs that are known to require JS rendering."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    query = parse_qs(parsed.query)
+
+    if "github.com" in host and path == "/search":
+        search_type = (query.get("type") or [""])[0].lower()
+        if search_type in {"users", "repositories", "issues", "pullrequests"}:
+            return True
+
+    return False
+
+
+def _looks_like_client_shell(url: str, html: str) -> bool:
+    """Detect HTML that is mostly app chrome rather than usable content."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    query = parse_qs(parsed.query)
+    html_lower = html.lower()
+
+    if "github.com" in host and path == "/search":
+        search_type = (query.get("type") or [""])[0].lower()
+        if search_type == "users":
+            if "user search results" in html_lower and "/search?" in html_lower:
+                missing_result_markers = [
+                    'data-testid="results-list"',
+                    'data-hovercard-type="user"',
+                    '/users/',
+                ]
+                return not any(marker in html_lower for marker in missing_result_markers)
+
+    return False
+
+
+async def _wait_for_page_content(page, url: str) -> None:
+    """Give JS-heavy pages a chance to populate useful content."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    query = parse_qs(parsed.query)
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except Exception:
+        logger.debug("networkidle wait timed out for %s", url)
+
+    if "github.com" in host and path == "/search":
+        search_type = (query.get("type") or [""])[0].lower()
+        if search_type == "users":
+            selectors = [
+                '[data-testid="results-list"]',
+                '[data-hovercard-type="user"]',
+                'a[href^="/"][data-hovercard-type="user"]',
+            ]
+            for selector in selectors:
+                try:
+                    await page.wait_for_selector(selector, timeout=5_000)
+                    return
+                except Exception:
+                    continue

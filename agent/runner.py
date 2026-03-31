@@ -55,11 +55,13 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
     )
 
     try:
-        await run_agent_loop(config, source, ctx)
+        run_result = await run_agent_loop(config, source, ctx)
     finally:
         await scraper.close()
         if emulator_browser:
             await emulator_browser.close()
+
+    _print_run_summary(config, source, writer, ctx, run_result)
 
 
 async def _run_emulator(config: dict, writer: StorageWriter) -> None:
@@ -99,6 +101,73 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
 
         # Run the agent loop — it will call fetch_page with social-media URLs
         # which are auto-routed to the human emulator via the tool dispatcher
-        await run_agent_loop(config, "human_emulator", ctx)
+        run_result = await run_agent_loop(config, "human_emulator", ctx)
     finally:
         await emulator_browser.close()
+
+    _print_run_summary(config, "human_emulator", writer, ctx, run_result)
+
+
+def _print_run_summary(
+    config: dict,
+    source: str,
+    writer: StorageWriter,
+    ctx: ToolContext,
+    run_result: dict,
+) -> None:
+    """Print a concise end-of-run summary with the output location."""
+    summary_status = _derive_summary_status(writer, run_result)
+
+    print("\n=== Job Summary ===")
+    print(f"Status     : {summary_status}")
+    print(f"Client     : {config['client_id']}")
+    print(f"Source     : {source}")
+    print(f"Output DB  : {writer.db_path}")
+    print(f"Steps run  : {run_result['steps_run']}")
+    print(f"Tool calls : {ctx.tool_call_count}")
+    print(f"Pages tried: {ctx.fetch_count}")
+    print(f"Fetch errs : {ctx.fetch_error_count}")
+    print(f"Saved new  : {writer.saved_count}")
+    print(f"Duplicates : {writer.duplicate_count}")
+    print(f"Failed URLs: {len(ctx.failed_urls)}")
+    print(f"Why stop   : {run_result['stop_reason']}")
+
+    if ctx._logged_sites_chosen:
+        print("\nSites chosen:")
+        for url in ctx._logged_sites_chosen[:10]:
+            print(f"  - {url}")
+
+    print("\nOutput:")
+    if writer.saved_rows:
+        for idx, row in enumerate(writer.saved_rows[:10], start=1):
+            label = row["name"] or row["source_url"]
+            details = " | ".join(
+                part for part in [row.get("job_title"), row.get("company")] if part
+            )
+            if details:
+                print(f"  {idx}. {label} | {details}")
+            else:
+                print(f"  {idx}. {label}")
+            print(f"     {row['source_url']}")
+    else:
+        print("  No new leads were saved in this run.")
+
+    if ctx.failed_urls:
+        print("\nFailures:")
+        for item in ctx.failed_urls[:5]:
+            print(f"  - {item['reason']}: {item['url']}")
+
+    print("\nLook here after each run:")
+    print(f"  - Terminal summary above")
+    print(f"  - Database file: {writer.db_path}")
+
+
+def _derive_summary_status(writer: StorageWriter, run_result: dict) -> str:
+    """Map raw run results to a quick human-readable status."""
+    if run_result["status"] == "error":
+        return "ERROR"
+    if writer.saved_count > 0:
+        return "SUCCESS"
+    if run_result["status"] == "max_steps":
+        return "INCOMPLETE"
+    return "NO RESULTS"
