@@ -30,10 +30,12 @@ think about what to do, call a tool, observe the result, think again.
 6. **When website is NA:** reason about which websites are most relevant for the given \
 job title, industry, and area. Target professional directories, company websites, \
 job boards, and relevant platforms. Log each site you choose by calling it.
+   In web-only runs, prefer non-social public websites and avoid choosing social-media sites.
 
 7. **For social-media URLs** (LinkedIn, Facebook, Instagram, Twitter/X):
    Call fetch_page normally — the system will automatically route them to the \
    human emulator. Do not try to handle social media differently.
+   If the source is `web`, do not choose social-media sites as targets.
 
 8. **Respect the field schema exactly.**
    Extract only the fields listed in the schema. Do not add extra fields.
@@ -68,13 +70,17 @@ def build_user_prompt(config: dict, source: str) -> str:
         site_instruction = (
             "No target website was specified. Reason about which websites are most relevant "
             f"for finding '{job_title}' leads for this job and generate your own target list. "
-            "Log every site you choose."
+            "Log every site you choose. "
+            "If source=web, avoid social-media websites and prefer public non-social sites."
         )
     else:
         site_instruction = f"Target website: **{website}**."
 
     source_instruction = {
-        "web": "Use the web scraper source. Search public websites and professional directories.",
+        "web": (
+            "Use the web scraper source. Search public websites and professional directories only. "
+            "Do not target LinkedIn, Facebook, Instagram, Twitter/X, or other social-media sites in this mode."
+        ),
         "human_emulator": (
             "Use the human emulator source. Process the social-media profiles in the queue. "
             "Call fetch_page with each profile URL and the system will route them correctly."
