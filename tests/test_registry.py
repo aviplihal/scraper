@@ -6,19 +6,23 @@ from tools.registry import ToolContext, dispatch_tool
 
 
 class _DummyWriter:
-    saved_count = 0
-    duplicate_count = 0
-    saved_rows = []
+    def __init__(self) -> None:
+        self.saved_count = 0
+        self.duplicate_count = 0
+        self.saved_rows: list[dict] = []
 
     async def append_row(self, url: str, data: dict, scrape_status: str = "ok") -> str:  # noqa: ARG002
+        self.saved_count += 1
+        self.saved_rows.append({"url": url, "data": data})
         return "saved"
 
 
 class RegistryTests(unittest.IsolatedAsyncioTestCase):
     async def test_web_mode_rejects_social_media_urls(self) -> None:
+        writer = _DummyWriter()
         ctx = ToolContext(
             client_config={"client_id": "test", "website": "NA"},
-            sheets_writer=_DummyWriter(),
+            sheets_writer=writer,
             source_mode="web",
         )
 
@@ -32,9 +36,10 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not allowed in web mode", result["error"])
 
     async def test_parse_html_rejects_search_pages(self) -> None:
+        writer = _DummyWriter()
         ctx = ToolContext(
             client_config={"client_id": "test", "website": "NA"},
-            sheets_writer=_DummyWriter(),
+            sheets_writer=writer,
             source_mode="web",
         )
         ctx.page_cache["fetch-1"] = "<html><body><a href='/alice'>Alice</a></body></html>"
@@ -56,6 +61,7 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("detail/profile pages", result["error"])
 
     async def test_parse_html_uses_builtin_field_names(self) -> None:
+        writer = _DummyWriter()
         ctx = ToolContext(
             client_config={
                 "client_id": "test",
@@ -66,7 +72,7 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
                     "company": "Company",
                 },
             },
-            sheets_writer=_DummyWriter(),
+            sheets_writer=writer,
             source_mode="web",
         )
         ctx.page_cache["fetch-2"] = """
@@ -103,6 +109,7 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_parse_html_github_falls_back_to_username_for_name(self) -> None:
+        writer = _DummyWriter()
         ctx = ToolContext(
             client_config={
                 "client_id": "test",
@@ -113,7 +120,7 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
                     "social_media": "Profile URL",
                 },
             },
-            sheets_writer=_DummyWriter(),
+            sheets_writer=writer,
             source_mode="web",
         )
         ctx.page_cache["fetch-3"] = """
@@ -147,6 +154,51 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
                 "social_media": "https://github.com/Big-Silver",
             },
         )
+
+    async def test_save_result_accepts_flat_arguments_with_fetch_id(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "https://github.com",
+                "fields": {
+                    "name": "Full name",
+                    "job_title": "Title",
+                    "company": "Company",
+                },
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.fetch_metadata["fetch-4"] = {
+            "url": "https://github.com/Big-Silver",
+            "final_url": "https://github.com/Big-Silver",
+            "title": "Big-Silver (Senior Software Engineer) · GitHub",
+            "page_kind": "profile",
+            "preview": "Big-Silver",
+        }
+        ctx.parsed_results["fetch-4"] = {
+            "name": "Big-Silver",
+            "job_title": "Full Stack Developer",
+            "company": None,
+        }
+
+        result = await dispatch_tool(
+            "save_result",
+            {
+                "fetch_id": "fetch-4",
+                "name": "Big-Silver",
+                "job_title": "Full Stack Developer",
+                "company": "None",
+                "email": "None",
+                "phone": "None",
+            },
+            ctx,
+        )
+
+        self.assertEqual(result["status"], "saved")
+        self.assertEqual(writer.saved_rows[0]["url"], "https://github.com/Big-Silver")
+        self.assertEqual(writer.saved_rows[0]["data"]["name"], "Big-Silver")
 
 
 if __name__ == "__main__":

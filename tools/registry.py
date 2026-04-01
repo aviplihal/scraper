@@ -90,6 +90,7 @@ class ToolContext:
     visited_urls:    set[str]        = field(default_factory=set)
     processed_fetch_ids: set[str]    = field(default_factory=set)
     domain_fetch_counts: dict[str, int] = field(default_factory=dict)
+    parsed_results:  dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +288,10 @@ async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> di
             ctx,
         )
     elif tool_name == "save_result":
-        return await _tool_save_result(arguments["url"], arguments.get("data", {}), ctx)
+        url, data = _coerce_save_result_args(arguments, ctx)
+        if not url:
+            return {"error": "save_result requires a source URL or fetch_id.", "arguments": arguments}
+        return await _tool_save_result(url, data, ctx)
     elif tool_name == "fail_url":
         return _tool_fail_url(arguments["url"], arguments.get("reason", ""), ctx)
     else:
@@ -472,6 +476,7 @@ def _tool_parse_html(
         return {"error": "No extractable field selectors available for this page."}
     result = parse_fields(html, selector_map)
     result = _postprocess_extracted_fields(fetch_id, result, field_names, ctx)
+    ctx.parsed_results[fetch_id] = result
     logger.debug("parse_html: %s → %s", fetch_id, result)
     return {"fields": result}
 
@@ -570,6 +575,51 @@ def _selector_map_for_fetch(
         for field in requested_fields
         if field in _GENERIC_PROFILE_SELECTORS
     }
+
+
+def _coerce_save_result_args(arguments: dict[str, Any], ctx: ToolContext) -> tuple[str, dict[str, Any]]:
+    """Normalize save_result arguments from strict or loose Ollama tool-call shapes."""
+    if not isinstance(arguments, dict):
+        return "", {}
+
+    url = arguments.get("url")
+    data = arguments.get("data")
+    fetch_id = arguments.get("fetch_id")
+
+    if isinstance(url, str) and isinstance(data, dict):
+        return url, data
+
+    if isinstance(fetch_id, str):
+        metadata = ctx.fetch_metadata.get(fetch_id, {})
+        inferred_url = metadata.get("final_url") or metadata.get("url") or ""
+        if isinstance(data, dict):
+            return inferred_url, data
+
+        if fetch_id in ctx.parsed_results:
+            parsed = ctx.parsed_results[fetch_id].copy()
+        else:
+            parsed = {}
+
+        control_keys = {"fetch_id", "url", "data"}
+        for key, value in arguments.items():
+            if key in control_keys:
+                continue
+            parsed[key] = None if value in {"None", "null"} else value
+
+        return inferred_url, parsed
+
+    if isinstance(url, str):
+        if isinstance(data, dict):
+            return url, data
+        control_keys = {"fetch_id", "url", "data"}
+        parsed = {
+            key: (None if value in {"None", "null"} else value)
+            for key, value in arguments.items()
+            if key not in control_keys
+        }
+        return url, parsed
+
+    return "", {}
 
 
 def _postprocess_extracted_fields(
