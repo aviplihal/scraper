@@ -55,6 +55,15 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                 options={"temperature": 0.1, "num_predict": 2048},
             )
         except Exception as exc:
+            if await _try_automatic_profile_processing(ctx, messages, step):
+                print(
+                    "[agent] Recovered from Ollama tool-call failure by automatically processing "
+                    "outstanding profile pages.",
+                    flush=True,
+                )
+                run_result["status"] = "completed"
+                run_result["stop_reason"] = "Recovered from Ollama tool-call failure using automatic profile processing."
+                break
             logger.error("Ollama call failed at step %d: %s", step, exc)
             print(f"[agent] ERROR: Ollama call failed — {exc}")
             run_result["status"] = "error"
@@ -77,6 +86,15 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                 print(f"[agent] Reminder: {reminder}", flush=True)
                 messages.append({"role": "user", "content": reminder})
                 continue
+
+            if await _try_automatic_profile_processing(ctx, messages, step):
+                print(
+                    "[agent] Automatic profile processing completed for outstanding fetched profile pages.",
+                    flush=True,
+                )
+                run_result["status"] = "completed"
+                run_result["stop_reason"] = "Automatic profile processing completed after the agent stopped making tool calls."
+                break
 
             print(f"\n[agent] Agent finished after {step} step(s) — no further tool calls.")
             run_result["status"] = "completed"
@@ -176,3 +194,62 @@ def _build_follow_through_reminder(ctx: ToolContext) -> str:
         "and fail_url on blocked, irrelevant, listing-only, or not-found pages. "
         f"Outstanding pages: {summary}"
     )
+
+
+async def _try_automatic_profile_processing(ctx: ToolContext, messages: list[dict], step: int) -> bool:
+    """Process outstanding profile pages directly when the model fails to continue."""
+    profile_fetch_ids = [
+        fetch_id
+        for fetch_id in _unprocessed_fetch_ids(ctx)
+        if ctx.fetch_metadata.get(fetch_id, {}).get("page_kind") == "profile"
+    ]
+    if not profile_fetch_ids:
+        return False
+
+    field_names = list(ctx.client_config.get("fields", {}).keys())
+    processed_any = False
+
+    for fetch_id in profile_fetch_ids[:3]:
+        metadata = ctx.fetch_metadata.get(fetch_id, {})
+        url = metadata.get("final_url") or metadata.get("url") or ""
+        parse_args = {"fetch_id": fetch_id, "field_names": field_names}
+        print(f"[step {step}] → parse_html({_fmt_args(parse_args)}) [auto]", flush=True)
+        parse_result = await dispatch_tool("parse_html", parse_args, ctx)
+        parse_result_str = json.dumps(parse_result, ensure_ascii=False)
+        print(f"[step {step}] ← {parse_result_str[:300]} [auto]", flush=True)
+        messages.append({"role": "tool", "content": parse_result_str})
+
+        fields = parse_result.get("fields", {})
+        name = fields.get("name") if isinstance(fields, dict) else None
+        if _looks_saveable_name(name):
+            save_args = {"url": url, "data": fields}
+            print(f"[step {step}] → save_result({_fmt_args(save_args)}) [auto]", flush=True)
+            save_result = await dispatch_tool("save_result", save_args, ctx)
+            save_result_str = json.dumps(save_result, ensure_ascii=False)
+            print(f"[step {step}] ← {save_result_str[:300]} [auto]", flush=True)
+            messages.append({"role": "tool", "content": save_result_str})
+        else:
+            fail_args = {
+                "url": url,
+                "reason": "Automatic profile processing could not extract a usable person identifier.",
+            }
+            print(f"[step {step}] → fail_url({_fmt_args(fail_args)}) [auto]", flush=True)
+            fail_result = await dispatch_tool("fail_url", fail_args, ctx)
+            fail_result_str = json.dumps(fail_result, ensure_ascii=False)
+            print(f"[step {step}] ← {fail_result_str[:300]} [auto]", flush=True)
+            messages.append({"role": "tool", "content": fail_result_str})
+
+        processed_any = True
+
+    return processed_any
+
+
+def _looks_saveable_name(value: object) -> bool:
+    """Return True when an extracted name is good enough to save."""
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if len(value) < 2:
+        return False
+    banned = {"senior software engineer", "software engineer", "developer", "engineer"}
+    return value.lower() not in banned
