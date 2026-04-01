@@ -12,7 +12,9 @@ import os
 from pathlib import Path
 
 from playwright.async_api import Browser, BrowserContext, Playwright, async_playwright
-from playwright_stealth import stealth_async
+from playwright_stealth import Stealth
+
+_stealth = Stealth()
 
 logger = logging.getLogger(__name__)
 
@@ -66,14 +68,14 @@ class EmulatorBrowser:
         return self._context
 
     async def _on_new_page(self, page) -> None:  # noqa: ANN001
-        await stealth_async(page)
+        await _stealth.apply_stealth_async(page)
 
     async def new_page(self):
         """Open a new page in the persistent context with stealth applied."""
         if self._context is None:
             raise RuntimeError("EmulatorBrowser not started — call start() first.")
         page = await self._context.new_page()
-        await stealth_async(page)
+        await _stealth.apply_stealth_async(page)
         return page
 
     async def close(self) -> None:

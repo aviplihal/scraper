@@ -1,0 +1,16 @@
+{
+  "client_id": "github_public_profiles",
+  "job": "find senior software engineers with public profiles we can market to",
+  "job_title": "Senior Software Engineer",
+  "area": "San Francisco Bay Area",
+  "website": "https://github.com",
+  "sources": ["web"],
+  "fields": {
+    "name": "Full name of the person",
+    "job_title": "Current job title or role",
+    "company": "Current company or employer name",
+    "email": "Email address",
+    "phone": "Phone number",
+    "social_media": "LinkedIn, Twitter, or other social media profile URL"
+  }
+}

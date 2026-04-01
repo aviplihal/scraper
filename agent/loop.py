@@ -73,12 +73,7 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
         if not message.tool_calls:
             if _should_request_follow_through(ctx) and follow_through_reminders < 2:
                 follow_through_reminders += 1
-                reminder = (
-                    "You have fetched pages but have not finished processing them. "
-                    "Do not stop yet. For each fetched page, either call parse_html to extract fields "
-                    "or call fail_url with a reason if the page is blocked, irrelevant, or only a job listing. "
-                    "If parse_html finds a real person lead, call save_result."
-                )
+                reminder = _build_follow_through_reminder(ctx)
                 print(f"[agent] Reminder: {reminder}", flush=True)
                 messages.append({"role": "user", "content": reminder})
                 continue
@@ -139,7 +134,45 @@ def _fmt_args(args: dict) -> str:
 
 
 def _should_request_follow_through(ctx: ToolContext) -> bool:
-    """Return True when the agent fetched pages but did not process any of them."""
-    saved_count = getattr(ctx.sheets_writer, "saved_count", 0)
-    fetch_only_run = ctx.tool_call_count > 0 and ctx.tool_call_count == ctx.fetch_count
-    return fetch_only_run and ctx.fetch_count > 0 and saved_count == 0 and not ctx.failed_urls
+    """Return True when fetched pages remain unprocessed."""
+    return bool(_unprocessed_fetch_ids(ctx))
+
+
+def _unprocessed_fetch_ids(ctx: ToolContext) -> list[str]:
+    """Return fetched pages that have not been handled by list_links/parse_html/fail_url."""
+    return [
+        fetch_id
+        for fetch_id in ctx.fetch_metadata
+        if fetch_id not in ctx.processed_fetch_ids
+    ]
+
+
+def _build_follow_through_reminder(ctx: ToolContext) -> str:
+    """Build a targeted reminder telling the model how to process fetched pages."""
+    instructions: list[str] = []
+    for fetch_id in _unprocessed_fetch_ids(ctx)[:3]:
+        metadata = ctx.fetch_metadata.get(fetch_id, {})
+        page_kind = metadata.get("page_kind", "unknown")
+        url = metadata.get("final_url") or metadata.get("url") or "unknown URL"
+
+        if page_kind in {"search_results", "directory"}:
+            action = (
+                f"{fetch_id} ({page_kind}) {url}: call list_links on this page to discover candidate profile/detail URLs."
+            )
+        elif page_kind == "profile":
+            action = (
+                f"{fetch_id} ({page_kind}) {url}: call parse_html on this detail/profile page, then save_result if the name is real."
+            )
+        else:
+            action = (
+                f"{fetch_id} ({page_kind}) {url}: call fail_url if it is blocked, irrelevant, not found, or listing-only."
+            )
+        instructions.append(action)
+
+    summary = " ".join(instructions)
+    return (
+        "You have fetched pages that are still unprocessed. "
+        "Use list_links on search_results/directory pages, parse_html on profile pages, "
+        "and fail_url on blocked, irrelevant, listing-only, or not-found pages. "
+        f"Outstanding pages: {summary}"
+    )

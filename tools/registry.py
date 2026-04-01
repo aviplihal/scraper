@@ -1,13 +1,15 @@
-"""Tool registry: Ollama tool-call definitions + async dispatcher.
+"""Tool registry: tool definitions plus the async dispatcher.
 
-Four tools are exposed to the agent:
-  1. fetch_page     — fetch a URL (auto-routes social media to human emulator)
-  2. parse_html     — extract fields from previously fetched HTML via CSS selectors
-  3. save_result    — write a lead row to the client's Google Sheet
-  4. fail_url       — log a URL failure and skip it
+Five tools are exposed to the agent:
+  1. fetch_page     — fetch a URL and classify the page
+  2. list_links     — extract candidate navigation/profile links from a page
+  3. parse_html     — extract fields from previously fetched HTML via CSS selectors
+  4. save_result    — write a lead row to the client's SQLite database
+  5. fail_url       — log a URL failure and skip it
 
 A ToolContext object is passed to every tool so they can share state
-(browser, page cache, human emulator, sheets writer) without globals.
+(browser, page cache, metadata, crawler state, human emulator, storage writer)
+without globals.
 """
 
 import json
@@ -15,11 +17,14 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
+from tools.discovery import build_preview, classify_page, extract_links
 from tools.fetcher import smart_fetch
 from tools.parser import parse_fields
 
 logger = logging.getLogger(__name__)
+_MAX_FETCHES_PER_DOMAIN = 8
 
 # Social-media domains that must be routed to the human emulator
 SOCIAL_MEDIA_DOMAINS: frozenset[str] = frozenset(
@@ -40,17 +45,24 @@ def _is_social_media(url: str) -> bool:
 class ToolContext:
     """Shared state passed to every tool execution."""
     client_config:  dict
-    sheets_writer:  Any                              # sheets.writer.SheetsWriter
+    sheets_writer:  Any                              # storage.writer.StorageWriter
+    source_mode:    str             = "web"
+    target_domain:  str | None      = None
     scraper_browser: Any | None      = None          # tools.browser.ScraperBrowser
     emulator_browser: Any | None     = None          # human_emulator.browser.EmulatorBrowser
     emulator_state:  Any | None      = None          # human_emulator.state.EmulatorState
     page_cache:      dict[str, str]  = field(default_factory=dict)   # fetch_id → HTML
+    fetch_metadata:  dict[str, dict[str, Any]] = field(default_factory=dict)  # fetch_id → metadata
+    url_to_fetch_id: dict[str, str]  = field(default_factory=dict)   # normalized url → fetch_id
     failed_url_flag: bool            = False          # set by fail_url to break the step loop
     _logged_sites_chosen: list[str]  = field(default_factory=list)   # for website=NA logging
     fetch_count:     int             = 0
     fetch_error_count: int           = 0
     tool_call_count: int             = 0
     failed_urls:     list[dict[str, str]] = field(default_factory=list)
+    visited_urls:    set[str]        = field(default_factory=set)
+    processed_fetch_ids: set[str]    = field(default_factory=set)
+    domain_fetch_counts: dict[str, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +78,7 @@ TOOL_DEFINITIONS = [
                 "Fetch a web page and return a preview of its content. "
                 "Social-media URLs (LinkedIn, Facebook, Instagram, Twitter/X) are automatically "
                 "routed to the human emulator. "
-                "Returns a fetch_id that must be passed to parse_html, plus a 3000-character text preview."
+                "Returns a fetch_id plus page metadata: final_url, title, page_kind, and a 3000-character text preview."
             ),
             "parameters": {
                 "type": "object",
@@ -85,6 +97,43 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["url", "needs_javascript"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_links",
+            "description": (
+                "Extract candidate navigation or profile links from a previously fetched page. "
+                "Use this on search results, directories, and list pages to discover person profile/detail pages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fetch_id": {
+                        "type": "string",
+                        "description": "The fetch_id returned by fetch_page.",
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": (
+                            "Optional CSS selector to narrow which elements to extract links from. "
+                            "If omitted, the system returns filtered candidate links automatically."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of links to return.",
+                        "default": 25,
+                    },
+                    "same_domain_only": {
+                        "type": "boolean",
+                        "description": "If true, only return links on the same domain as the fetched page.",
+                        "default": False,
+                    },
+                },
+                "required": ["fetch_id"],
             },
         },
     },
@@ -122,7 +171,7 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "save_result",
             "description": (
-                "Save a lead result to the client's Google Sheet. "
+                "Save a lead result to the client's SQLite database. "
                 "Call this once per lead after extracting all available fields. "
                 "Pass null for any field that could not be found on the page."
             ),
@@ -182,6 +231,14 @@ async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> di
     ctx.tool_call_count += 1
     if tool_name == "fetch_page":
         return await _tool_fetch_page(arguments["url"], arguments["needs_javascript"], ctx)
+    elif tool_name == "list_links":
+        return _tool_list_links(
+            arguments["fetch_id"],
+            arguments.get("selector"),
+            arguments.get("limit", 25),
+            arguments.get("same_domain_only", False),
+            ctx,
+        )
     elif tool_name == "parse_html":
         return _tool_parse_html(arguments["fetch_id"], arguments.get("fields", {}), ctx)
     elif tool_name == "save_result":
@@ -198,13 +255,42 @@ async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> di
 
 async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -> dict:
     logger.info("fetch_page: %s (js=%s)", url, needs_javascript)
-    ctx.fetch_count += 1
+    normalized_url = _normalize_url(url)
+    domain = _domain_for_url(url)
+
+    if normalized_url in ctx.url_to_fetch_id:
+        fetch_id = ctx.url_to_fetch_id[normalized_url]
+        cached = ctx.fetch_metadata[fetch_id].copy()
+        cached["fetch_id"] = fetch_id
+        return cached
 
     if _is_social_media(url):
+        if ctx.source_mode == "web":
+            ctx.fetch_error_count += 1
+            return {
+                "error": "Social-media URLs are not allowed in web mode.",
+                "url": url,
+            }
+
+        ctx.fetch_count += 1
         result = await _fetch_social_media(url, ctx)
         if "error" in result:
             ctx.fetch_error_count += 1
         return result
+
+    if ctx.target_domain and not _same_or_subdomain(domain, ctx.target_domain):
+        ctx.fetch_error_count += 1
+        return {
+            "error": f"URL is outside the configured target website ({ctx.target_domain}).",
+            "url": url,
+        }
+
+    if ctx.domain_fetch_counts.get(domain, 0) >= _MAX_FETCHES_PER_DOMAIN:
+        ctx.fetch_error_count += 1
+        return {
+            "error": f"Fetch budget reached for domain '{domain}' in this run.",
+            "url": url,
+        }
 
     # Log site if website=NA (agent chose this target itself)
     if ctx.client_config.get("website", "NA").upper() == "NA":
@@ -213,7 +299,7 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
             logger.info("Agent-chosen target site: %s", url)
 
     try:
-        html = await smart_fetch(
+        fetch_result = await smart_fetch(
             url,
             needs_javascript,
             get_context=ctx.scraper_browser.new_context,
@@ -223,15 +309,26 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
         ctx.fetch_error_count += 1
         return {"error": str(exc), "url": url}
 
+    ctx.fetch_count += 1
+    ctx.domain_fetch_counts[domain] = ctx.domain_fetch_counts.get(domain, 0) + 1
+
     fetch_id = str(uuid.uuid4())
-    ctx.page_cache[fetch_id] = html
+    ctx.page_cache[fetch_id] = fetch_result.html
+    page_info = classify_page(url, fetch_result.final_url, fetch_result.html)
+    preview = build_preview(fetch_result.html)
+    metadata = {
+        "url": url,
+        "final_url": page_info.final_url,
+        "title": page_info.title,
+        "page_kind": page_info.page_kind,
+        "preview": preview,
+    }
+    ctx.fetch_metadata[fetch_id] = metadata
+    ctx.url_to_fetch_id[normalized_url] = fetch_id
+    ctx.url_to_fetch_id[_normalize_url(page_info.final_url)] = fetch_id
+    ctx.visited_urls.add(_normalize_url(page_info.final_url))
 
-    # Build a text preview from the first 3000 characters of visible text
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
-    text_preview = soup.get_text(separator=" ", strip=True)[:3000]
-
-    return {"fetch_id": fetch_id, "url": url, "preview": text_preview}
+    return {"fetch_id": fetch_id, **metadata}
 
 
 async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
@@ -251,7 +348,9 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
     from human_emulator.linkedin import LinkedInEmulator
 
     # Instantiate a short-lived emulator just for this URL
-    context = await ctx.emulator_browser.start()
+    context = getattr(ctx.emulator_browser, "_context", None)
+    if context is None:
+        context = await ctx.emulator_browser.start()
     emulator = LinkedInEmulator(context, ctx.emulator_state, ctx.client_config["client_id"])
     await emulator.process_profiles([url], on_result)
 
@@ -267,19 +366,66 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
     ctx.page_cache[fetch_id] = fake_html
 
     preview = json.dumps(data, indent=2)
-    return {"fetch_id": fetch_id, "url": url, "preview": preview, "extracted_data": data}
+    metadata = {
+        "url": url,
+        "final_url": url,
+        "title": data.get("name") or "Social profile",
+        "page_kind": "profile",
+        "preview": preview,
+    }
+    ctx.fetch_metadata[fetch_id] = metadata
+    ctx.url_to_fetch_id[_normalize_url(url)] = fetch_id
+    return {"fetch_id": fetch_id, **metadata, "extracted_data": data}
+
+
+def _tool_list_links(
+    fetch_id: str,
+    selector: str | None,
+    limit: int,
+    same_domain_only: bool,
+    ctx: ToolContext,
+) -> dict:
+    html = ctx.page_cache.get(fetch_id)
+    metadata = ctx.fetch_metadata.get(fetch_id)
+    if not html or not metadata:
+        return {"error": f"No cached HTML for fetch_id '{fetch_id}'. Call fetch_page first."}
+
+    ctx.processed_fetch_ids.add(fetch_id)
+    base_url = metadata.get("final_url") or metadata.get("url")
+    effective_same_domain = same_domain_only or bool(ctx.target_domain)
+    links = extract_links(
+        html,
+        base_url,
+        selector=selector,
+        limit=max(1, min(int(limit), 50)),
+        same_domain_only=effective_same_domain,
+    )
+    return {"links": links, "count": len(links)}
 
 
 def _tool_parse_html(fetch_id: str, fields: dict[str, str], ctx: ToolContext) -> dict:
     html = ctx.page_cache.get(fetch_id)
     if not html:
         return {"error": f"No cached HTML for fetch_id '{fetch_id}'. Call fetch_page first."}
+    metadata = ctx.fetch_metadata.get(fetch_id, {})
+    page_kind = metadata.get("page_kind", "unknown")
+    if page_kind not in {"profile", "unknown"}:
+        return {
+            "error": (
+                f"parse_html is only for detail/profile pages. "
+                f"fetch_id '{fetch_id}' is classified as '{page_kind}'. Use list_links or fail_url instead."
+            )
+        }
+    ctx.processed_fetch_ids.add(fetch_id)
     result = parse_fields(html, fields)
     logger.debug("parse_html: %s → %s", fetch_id, result)
     return {"fields": result}
 
 
 async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
+    if not _is_plausible_person_name(data.get("name")):
+        return {"error": "Lead must include a plausible person name before saving.", "url": url}
+
     try:
         status = await ctx.sheets_writer.append_row(url, data)
         if status == "saved":
@@ -296,4 +442,52 @@ def _tool_fail_url(url: str, reason: str, ctx: ToolContext) -> dict:
     logger.info("fail_url: %s — %s", url, reason)
     ctx.failed_url_flag = True
     ctx.failed_urls.append({"url": url, "reason": reason})
+    fetch_id = ctx.url_to_fetch_id.get(_normalize_url(url))
+    if fetch_id:
+        ctx.processed_fetch_ids.add(fetch_id)
     return {"status": "failed", "url": url, "reason": reason}
+
+
+def _normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme and parsed.path:
+        parsed = urlparse(f"https://{url}")
+    normalized = parsed._replace(fragment="")
+    return normalized.geturl()
+
+
+def _domain_for_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme and parsed.path:
+        parsed = urlparse(f"https://{url}")
+    return parsed.netloc.lower().split(":", 1)[0].removeprefix("www.")
+
+
+def _same_or_subdomain(host: str, target_host: str) -> bool:
+    host = host.removeprefix("www.")
+    target_host = target_host.removeprefix("www.")
+    return host == target_host or host.endswith(f".{target_host}")
+
+
+def _is_plausible_person_name(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    name = value.strip()
+    if len(name) < 2 or len(name) > 80:
+        return False
+    banned = {
+        "sign in",
+        "log in",
+        "login",
+        "home",
+        "jobs",
+        "careers",
+        "just a moment",
+        "page not found",
+        "directory",
+        "search results",
+    }
+    lowered = name.lower()
+    if lowered in banned:
+        return False
+    return any(char.isalpha() for char in name)

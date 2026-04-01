@@ -9,6 +9,7 @@ Rules:
 """
 
 import logging
+from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -29,11 +30,19 @@ _HEADERS         = {
 }
 
 
+@dataclass(slots=True)
+class FetchResult:
+    """Raw fetch result with HTML and final landing URL."""
+
+    html: str
+    final_url: str
+
+
 async def smart_fetch(
     url: str,
     needs_javascript: bool,
     get_context,  # Callable[[], Awaitable[BrowserContext]]
-) -> str:
+) -> FetchResult:
     """Fetch a URL and return the full HTML string.
 
     Args:
@@ -42,21 +51,21 @@ async def smart_fetch(
         get_context:      Async callable that returns a fresh BrowserContext.
 
     Returns:
-        HTML string of the page.
+        HTML string plus final landing URL.
     """
     if _should_force_browser(url):
         logger.debug("smart_fetch: forcing Playwright for %s", url)
         return await _fetch_playwright(url, get_context)
 
     if not needs_javascript:
-        html = await _fetch_httpx(url)
+        html, final_url = await _fetch_httpx(url)
         if (
             html
             and _visible_text_length(html) >= _MIN_TEXT_LENGTH
             and not _looks_like_client_shell(url, html)
         ):
             logger.debug("smart_fetch: httpx succeeded for %s", url)
-            return html
+            return FetchResult(html=html, final_url=final_url or url)
         logger.debug(
             "smart_fetch: httpx result unusable (%d chars text) — falling back to Playwright for %s",
             _visible_text_length(html) if html else 0,
@@ -66,7 +75,7 @@ async def smart_fetch(
     return await _fetch_playwright(url, get_context)
 
 
-async def _fetch_httpx(url: str) -> str | None:
+async def _fetch_httpx(url: str) -> tuple[str | None, str]:
     try:
         async with httpx.AsyncClient(
             headers=_HEADERS,
@@ -75,21 +84,21 @@ async def _fetch_httpx(url: str) -> str | None:
         ) as client:
             resp = await client.get(url)
             if resp.status_code == 200:
-                return resp.text
+                return resp.text, str(resp.url)
             logger.debug("httpx returned %s for %s", resp.status_code, url)
     except Exception as exc:
         logger.debug("httpx failed for %s: %s", url, exc)
-    return None
+    return None, url
 
 
-async def _fetch_playwright(url: str, get_context) -> str:
+async def _fetch_playwright(url: str, get_context) -> FetchResult:
     ctx = await get_context()
     page = await ctx.new_page()
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         await _wait_for_page_content(page, url)
         html = await page.content()
-        return html
+        return FetchResult(html=html, final_url=page.url)
     finally:
         await page.close()
         await ctx.close()

@@ -5,6 +5,7 @@ browser and emulator instances before running the agent loop.
 """
 
 import logging
+from urllib.parse import urlparse
 
 from agent.loop import run_agent_loop
 from human_emulator.browser import EmulatorBrowser
@@ -49,6 +50,8 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
     ctx = ToolContext(
         client_config    = config,
         sheets_writer    = writer,
+        source_mode      = source,
+        target_domain    = _target_domain_for_config(config),
         scraper_browser  = scraper,
         emulator_browser = emulator_browser,
         emulator_state   = emulator_state,
@@ -74,6 +77,8 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
     ctx = ToolContext(
         client_config    = config,
         sheets_writer    = writer,
+        source_mode      = "human_emulator",
+        target_domain    = _target_domain_for_config(config),
         emulator_browser = emulator_browser,
         emulator_state   = emulator_state,
     )
@@ -157,6 +162,16 @@ def _print_run_summary(
         for item in ctx.failed_urls[:5]:
             print(f"  - {item['reason']}: {item['url']}")
 
+    unprocessed = [
+        ctx.fetch_metadata[fetch_id]
+        for fetch_id in ctx.fetch_metadata
+        if fetch_id not in ctx.processed_fetch_ids
+    ]
+    if unprocessed:
+        print("\nUnprocessed pages:")
+        for item in unprocessed[:5]:
+            print(f"  - {item['page_kind']}: {item['final_url']}")
+
     print("\nLook here after each run:")
     print(f"  - Terminal summary above")
     print(f"  - Database file: {writer.db_path}")
@@ -171,3 +186,14 @@ def _derive_summary_status(writer: StorageWriter, run_result: dict) -> str:
     if run_result["status"] == "max_steps":
         return "INCOMPLETE"
     return "NO RESULTS"
+
+
+def _target_domain_for_config(config: dict) -> str | None:
+    """Return the configured target domain, if the client pinned a website."""
+    website = str(config.get("website", "NA")).strip()
+    if not website or website.upper() == "NA":
+        return None
+
+    parsed = urlparse(website if "://" in website else f"https://{website}")
+    host = parsed.netloc or parsed.path
+    return host.lower().split(":", 1)[0].removeprefix("www.") or None
