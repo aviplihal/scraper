@@ -23,7 +23,7 @@ think briefly, call a tool, observe the result, think again.
 
 4. **Use fetch_page to get a page, then choose the correct next tool.**
    - For search, directory, and listing pages: use list_links
-   - For detail/profile pages: use parse_html
+   - For detail/profile pages: use parse_html with field_names
    Always call fetch_page before list_links or parse_html.
 
 5. **Save one row per lead with save_result.**
@@ -65,9 +65,9 @@ For each URL you consider:
 1. fetch_page(url, needs_javascript)
 2. Inspect page_kind and preview
 3. If page_kind is search_results or directory:
-   call list_links(fetch_id, ...)
+   call list_links(fetch_id, limit=5, ...)
 4. If page_kind is profile:
-   call parse_html(fetch_id, fields)
+   call parse_html(fetch_id, field_names=[...])
 5. If parse_html yields a plausible real person:
    call save_result(url, data)
 6. If blocked, irrelevant, empty, or not a person-lead source:
@@ -80,6 +80,7 @@ For each URL you consider:
 - Do not brainstorm implementation ideas.
 - Do not keep retrying the same kind of irrelevant site.
 - When website is specified, stay on that website/domain.
+- After list_links, fetch and process only 1 to 2 candidate profile pages at a time before asking for more links.
 - If a page is clearly a job board listing page instead of a people directory, mark it failed and move on.
 - If a page is blocked by captcha or "Just a moment" protection, mark it failed and move on.
 - Prefer concrete progress over commentary.

@@ -25,6 +25,32 @@ from tools.parser import parse_fields
 
 logger = logging.getLogger(__name__)
 _MAX_FETCHES_PER_DOMAIN = 8
+_GITHUB_PROFILE_SELECTORS: dict[str, list[str]] = {
+    "name": ["span[itemprop='name']", "h1.vcard-names span.p-name", "h1 span.p-name"],
+    "job_title": ["div.p-note", "div.js-profile-editable-area div.p-note", "span.p-note"],
+    "company": ["li[itemprop='worksFor'] span.p-org", "span.p-org", "li.vcard-detail[itemprop='worksFor'] a"],
+    "email": ["li[itemprop='email'] a[href^='mailto:']", "a.u-email[href^='mailto:']"],
+    "phone": ["a[href^='tel:']"],
+    "social_media": [
+        "li[itemprop='url'] a",
+        "a.Link--primary[href*='linkedin.com']",
+        "a.Link--primary[href*='twitter.com']",
+        "a.Link--primary[href*='x.com']",
+    ],
+}
+_GENERIC_PROFILE_SELECTORS: dict[str, list[str]] = {
+    "name": ["h1", "[itemprop='name']", ".name", ".profile-name"],
+    "job_title": [".title", ".job-title", ".headline", ".role", "[itemprop='jobTitle']"],
+    "company": [".company", ".organization", "[itemprop='worksFor']", ".employer"],
+    "email": ["a[href^='mailto:']"],
+    "phone": ["a[href^='tel:']"],
+    "social_media": [
+        "a[href*='linkedin.com']",
+        "a[href*='twitter.com']",
+        "a[href*='x.com']",
+        "a[href*='github.com']",
+    ],
+}
 
 # Social-media domains that must be routed to the human emulator
 SOCIAL_MEDIA_DOMAINS: frozenset[str] = frozenset(
@@ -153,16 +179,29 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "The fetch_id returned by fetch_page.",
                     },
+                    "field_names": {
+                        "type": "array",
+                        "description": (
+                            "Field names to extract from a detail/profile page. "
+                            "Use the client's schema fields, for example: ['name', 'job_title', 'company', 'email']."
+                        ),
+                        "items": {"type": "string"},
+                    },
                     "fields": {
                         "type": "object",
                         "description": (
-                            "Mapping of field_name to CSS selector string. "
-                            "Example: {\"name\": \"h1.profile-name\", \"email\": \"a[href^='mailto:']\"}."
+                            "Optional advanced mapping of field_name to CSS selector string. "
+                            "Prefer field_names for normal usage."
                         ),
-                        "additionalProperties": {"type": "string"},
+                        "additionalProperties": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}},
+                            ]
+                        },
                     },
                 },
-                "required": ["fetch_id", "fields"],
+                "required": ["fetch_id"],
             },
         },
     },
@@ -240,7 +279,12 @@ async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> di
             ctx,
         )
     elif tool_name == "parse_html":
-        return _tool_parse_html(arguments["fetch_id"], arguments.get("fields", {}), ctx)
+        return _tool_parse_html(
+            arguments["fetch_id"],
+            arguments.get("field_names"),
+            arguments.get("fields", {}),
+            ctx,
+        )
     elif tool_name == "save_result":
         return await _tool_save_result(arguments["url"], arguments.get("data", {}), ctx)
     elif tool_name == "fail_url":
@@ -403,7 +447,12 @@ def _tool_list_links(
     return {"links": links, "count": len(links)}
 
 
-def _tool_parse_html(fetch_id: str, fields: dict[str, str], ctx: ToolContext) -> dict:
+def _tool_parse_html(
+    fetch_id: str,
+    field_names: list[str] | None,
+    fields: dict[str, str | list[str]],
+    ctx: ToolContext,
+) -> dict:
     html = ctx.page_cache.get(fetch_id)
     if not html:
         return {"error": f"No cached HTML for fetch_id '{fetch_id}'. Call fetch_page first."}
@@ -417,7 +466,10 @@ def _tool_parse_html(fetch_id: str, fields: dict[str, str], ctx: ToolContext) ->
             )
         }
     ctx.processed_fetch_ids.add(fetch_id)
-    result = parse_fields(html, fields)
+    selector_map = fields or _selector_map_for_fetch(fetch_id, field_names, ctx)
+    if not selector_map:
+        return {"error": "No extractable field selectors available for this page."}
+    result = parse_fields(html, selector_map)
     logger.debug("parse_html: %s → %s", fetch_id, result)
     return {"fields": result}
 
@@ -491,3 +543,28 @@ def _is_plausible_person_name(value: Any) -> bool:
     if lowered in banned:
         return False
     return any(char.isalpha() for char in name)
+
+
+def _selector_map_for_fetch(
+    fetch_id: str,
+    field_names: list[str] | None,
+    ctx: ToolContext,
+) -> dict[str, list[str]]:
+    """Return built-in selector presets for the given fetched page."""
+    metadata = ctx.fetch_metadata.get(fetch_id, {})
+    final_url = metadata.get("final_url") or metadata.get("url") or ""
+    domain = _domain_for_url(final_url)
+    requested_fields = field_names or list(ctx.client_config.get("fields", {}).keys())
+
+    if domain == "github.com":
+        return {
+            field: _GITHUB_PROFILE_SELECTORS[field]
+            for field in requested_fields
+            if field in _GITHUB_PROFILE_SELECTORS
+        }
+
+    return {
+        field: _GENERIC_PROFILE_SELECTORS[field]
+        for field in requested_fields
+        if field in _GENERIC_PROFILE_SELECTORS
+    }

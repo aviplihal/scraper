@@ -55,6 +55,53 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("error", result)
         self.assertIn("detail/profile pages", result["error"])
 
+    async def test_parse_html_uses_builtin_field_names(self) -> None:
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "https://github.com",
+                "fields": {
+                    "name": "Full name",
+                    "job_title": "Title",
+                    "company": "Company",
+                },
+            },
+            sheets_writer=_DummyWriter(),
+            source_mode="web",
+        )
+        ctx.page_cache["fetch-2"] = """
+        <html>
+          <head><title>alice-smith (Senior Software Engineer) · GitHub</title></head>
+          <body>
+            <span itemprop="name">Alice Smith</span>
+            <div class="p-note">Senior Software Engineer</div>
+            <span class="p-org">Example Co</span>
+          </body>
+        </html>
+        """
+        ctx.fetch_metadata["fetch-2"] = {
+            "url": "https://github.com/alice-smith",
+            "final_url": "https://github.com/alice-smith",
+            "title": "alice-smith (Senior Software Engineer) · GitHub",
+            "page_kind": "profile",
+            "preview": "Alice Smith",
+        }
+
+        result = await dispatch_tool(
+            "parse_html",
+            {"fetch_id": "fetch-2", "field_names": ["name", "job_title", "company"]},
+            ctx,
+        )
+
+        self.assertEqual(
+            result["fields"],
+            {
+                "name": "Alice Smith",
+                "job_title": "Senior Software Engineer",
+                "company": "Example Co",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
