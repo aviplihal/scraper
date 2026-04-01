@@ -29,6 +29,7 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
     ]
 
     client = ollama.AsyncClient()
+    follow_through_reminders = 0
     run_result = {
         "steps_run": 0,
         "status": "unknown",
@@ -70,6 +71,18 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
         messages.append({"role": "assistant", "content": message.content or "", "tool_calls": message.tool_calls})
 
         if not message.tool_calls:
+            if _should_request_follow_through(ctx) and follow_through_reminders < 2:
+                follow_through_reminders += 1
+                reminder = (
+                    "You have fetched pages but have not finished processing them. "
+                    "Do not stop yet. For each fetched page, either call parse_html to extract fields "
+                    "or call fail_url with a reason if the page is blocked, irrelevant, or only a job listing. "
+                    "If parse_html finds a real person lead, call save_result."
+                )
+                print(f"[agent] Reminder: {reminder}", flush=True)
+                messages.append({"role": "user", "content": reminder})
+                continue
+
             print(f"\n[agent] Agent finished after {step} step(s) — no further tool calls.")
             run_result["status"] = "completed"
             run_result["stop_reason"] = "Agent stopped making tool calls."
@@ -123,3 +136,10 @@ def _fmt_args(args: dict) -> str:
             v_str = v_str[:77] + "..."
         parts.append(f"{k}={v_str!r}")
     return ", ".join(parts)
+
+
+def _should_request_follow_through(ctx: ToolContext) -> bool:
+    """Return True when the agent fetched pages but did not process any of them."""
+    saved_count = getattr(ctx.sheets_writer, "saved_count", 0)
+    fetch_only_run = ctx.tool_call_count > 0 and ctx.tool_call_count == ctx.fetch_count
+    return fetch_only_run and ctx.fetch_count > 0 and saved_count == 0 and not ctx.failed_urls
