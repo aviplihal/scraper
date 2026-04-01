@@ -102,6 +102,52 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_parse_html_github_falls_back_to_username_for_name(self) -> None:
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "https://github.com",
+                "fields": {
+                    "name": "Full name",
+                    "job_title": "Title",
+                    "social_media": "Profile URL",
+                },
+            },
+            sheets_writer=_DummyWriter(),
+            source_mode="web",
+        )
+        ctx.page_cache["fetch-3"] = """
+        <html>
+          <head><title>Big-Silver (Senior Software Engineer) · GitHub</title></head>
+          <body>
+            <span itemprop="name">Senior Software Engineer</span>
+            <div class="p-note">As a full stack developer, I have over than 11 years of web development background.</div>
+          </body>
+        </html>
+        """
+        ctx.fetch_metadata["fetch-3"] = {
+            "url": "https://github.com/Big-Silver",
+            "final_url": "https://github.com/Big-Silver",
+            "title": "Big-Silver (Senior Software Engineer) · GitHub",
+            "page_kind": "profile",
+            "preview": "Big-Silver (Senior Software Engineer) · GitHub",
+        }
+
+        result = await dispatch_tool(
+            "parse_html",
+            {"fetch_id": "fetch-3", "field_names": ["name", "job_title", "social_media"]},
+            ctx,
+        )
+
+        self.assertEqual(
+            result["fields"],
+            {
+                "name": "Big-Silver",
+                "job_title": "As a full stack developer, I have over than 11 years of web development background.",
+                "social_media": "https://github.com/Big-Silver",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

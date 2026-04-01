@@ -57,6 +57,7 @@ Log each site you choose by calling it.
 
 11. **Every saved lead must come from parse_html on a detail/profile page.**
     Do not save directly from search results, directories, or list pages.
+    If a profile exposes only a username/handle and not a separate full name, the username is still a valid lead identifier.
 
 ## Required workflow
 

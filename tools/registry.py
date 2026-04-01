@@ -14,6 +14,7 @@ without globals.
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -470,6 +471,7 @@ def _tool_parse_html(
     if not selector_map:
         return {"error": "No extractable field selectors available for this page."}
     result = parse_fields(html, selector_map)
+    result = _postprocess_extracted_fields(fetch_id, result, field_names, ctx)
     logger.debug("parse_html: %s → %s", fetch_id, result)
     return {"fields": result}
 
@@ -568,3 +570,89 @@ def _selector_map_for_fetch(
         for field in requested_fields
         if field in _GENERIC_PROFILE_SELECTORS
     }
+
+
+def _postprocess_extracted_fields(
+    fetch_id: str,
+    result: dict[str, Any],
+    field_names: list[str] | None,
+    ctx: ToolContext,
+) -> dict[str, Any]:
+    """Clean up extracted fields using page-specific metadata."""
+    metadata = ctx.fetch_metadata.get(fetch_id, {})
+    final_url = metadata.get("final_url") or metadata.get("url") or ""
+    title = metadata.get("title", "")
+    domain = _domain_for_url(final_url)
+    requested_fields = set(field_names or result.keys())
+
+    if domain == "github.com":
+        username = _github_username_from_url(final_url)
+        derived_title = _github_role_from_title(title, username)
+        name = result.get("name")
+        job_title = result.get("job_title")
+
+        if _looks_like_role_text(name):
+            result["name"] = username or name
+
+        if "job_title" in requested_fields and not result.get("job_title") and derived_title:
+            result["job_title"] = derived_title
+
+        if "job_title" in requested_fields and result.get("job_title") == result.get("name") and derived_title:
+            result["job_title"] = derived_title
+
+        if "social_media" in requested_fields and not result.get("social_media"):
+            result["social_media"] = final_url
+
+        if "name" in requested_fields and not result.get("name") and username:
+            result["name"] = username
+
+        if job_title and username and str(job_title).strip() == username:
+            result["job_title"] = derived_title
+
+    return result
+
+
+def _github_username_from_url(url: str) -> str | None:
+    """Return the GitHub username from a profile URL."""
+    parsed = urlparse(url)
+    parts = [segment for segment in parsed.path.split("/") if segment]
+    if len(parts) == 1:
+        return parts[0]
+    return None
+
+
+def _github_role_from_title(title: str, username: str | None) -> str | None:
+    """Extract the role text from a GitHub profile page title."""
+    if not title:
+        return None
+    pattern = r"^(.*?) \((.*?)\) · GitHub$"
+    match = re.match(pattern, title)
+    if not match:
+        return None
+    first, second = match.groups()
+    if username and first.strip() == username:
+        return second.strip() or None
+    if username and second.strip() == username:
+        return first.strip() or None
+    return second.strip() or None
+
+
+def _looks_like_role_text(value: Any) -> bool:
+    """Return True when a value looks more like a role/headline than a person identifier."""
+    if not isinstance(value, str):
+        return False
+    lowered = value.strip().lower()
+    if not lowered:
+        return False
+    role_words = {
+        "engineer",
+        "developer",
+        "designer",
+        "manager",
+        "founder",
+        "consultant",
+        "architect",
+        "marketer",
+        "scientist",
+    }
+    return any(word in lowered for word in role_words)
