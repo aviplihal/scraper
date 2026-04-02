@@ -252,12 +252,16 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "The URL that failed.",
                     },
+                    "fetch_id": {
+                        "type": "string",
+                        "description": "Optional fetch_id for a previously fetched page when you want the system to infer the URL.",
+                    },
                     "reason": {
                         "type": "string",
                         "description": "Brief reason for the failure.",
                     },
                 },
-                "required": ["url", "reason"],
+                "required": ["reason"],
             },
         },
     },
@@ -294,7 +298,10 @@ async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> di
             return {"error": "save_result requires a source URL or fetch_id.", "arguments": arguments}
         return await _tool_save_result(url, data, ctx)
     elif tool_name == "fail_url":
-        return _tool_fail_url(arguments["url"], arguments.get("reason", ""), ctx)
+        url = _coerce_fail_url(arguments, ctx)
+        if not url:
+            return {"error": "fail_url requires a source URL or fetch_id.", "arguments": arguments}
+        return _tool_fail_url(url, arguments.get("reason", ""), ctx)
     else:
         return {"error": f"Unknown tool: {tool_name}"}
 
@@ -655,6 +662,25 @@ def _coerce_save_result_args(arguments: dict[str, Any], ctx: ToolContext) -> tup
         return url, parsed
 
     return "", {}
+
+
+def _coerce_fail_url(arguments: dict[str, Any], ctx: ToolContext) -> str:
+    """Normalize fail_url arguments from strict or loose Ollama tool-call shapes."""
+    if not isinstance(arguments, dict):
+        return ""
+
+    url = arguments.get("url")
+    if isinstance(url, str) and url.strip():
+        return url
+
+    fetch_id = arguments.get("fetch_id")
+    if isinstance(fetch_id, str):
+        metadata = ctx.fetch_metadata.get(fetch_id, {})
+        inferred_url = metadata.get("final_url") or metadata.get("url") or ""
+        if inferred_url:
+            return inferred_url
+
+    return ""
 
 
 def _postprocess_extracted_fields(

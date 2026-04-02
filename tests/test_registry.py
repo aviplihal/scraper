@@ -276,6 +276,32 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writer.saved_count, 1)
         self.assertEqual(writer.duplicate_count, 1)
 
+    async def test_fail_url_accepts_fetch_id_without_url(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.fetch_metadata["fetch-5"] = {
+            "url": "https://www.crunchbase.com/people",
+            "final_url": "https://www.crunchbase.com/people",
+            "title": "Just a moment...",
+            "page_kind": "blocked",
+            "preview": "blocked",
+        }
+        ctx.url_to_fetch_id["https://www.crunchbase.com/people"] = "fetch-5"
+
+        result = await dispatch_tool(
+            "fail_url",
+            {"fetch_id": "fetch-5", "reason": "blocked"},
+            ctx,
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["url"], "https://www.crunchbase.com/people")
+        self.assertIn("fetch-5", ctx.processed_fetch_ids)
+
 
 if __name__ == "__main__":
     unittest.main()
