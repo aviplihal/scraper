@@ -91,6 +91,7 @@ class ToolContext:
     processed_fetch_ids: set[str]    = field(default_factory=set)
     domain_fetch_counts: dict[str, int] = field(default_factory=dict)
     parsed_results:  dict[str, dict[str, Any]] = field(default_factory=dict)
+    rejected_weak_count: int           = 0
 
 
 # ---------------------------------------------------------------------------
@@ -482,8 +483,12 @@ def _tool_parse_html(
 
 
 async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
-    if not _is_plausible_person_name(data.get("name")):
-        return {"error": "Lead must include a plausible person name before saving.", "url": url}
+    viable, reason = _is_minimally_viable_lead(data, url)
+    if not viable:
+        ctx.rejected_weak_count += 1
+        logger.info("Rejected weak lead: %s — %s", url, reason)
+        print(f"  • Weak lead rejected: {data.get('name') or url} ({reason})", flush=True)
+        return {"status": "rejected", "url": url, "reason": reason}
 
     try:
         status = await ctx.sheets_writer.append_row(url, data)
@@ -550,6 +555,36 @@ def _is_plausible_person_name(value: Any) -> bool:
     if lowered in banned:
         return False
     return any(char.isalpha() for char in name)
+
+
+def _has_meaningful_value(value: Any) -> bool:
+    """Return True when a field value is present enough to count as supporting lead data."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "none", "null", "n/a", "na"}
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _is_minimally_viable_lead(data: dict[str, Any], source_url: str) -> tuple[bool, str]:
+    """Return whether a lead is strong enough to count toward the run target."""
+    if not _is_plausible_person_name(data.get("name")):
+        return False, "missing a plausible person identifier in name"
+
+    support_fields = ("job_title", "company", "email", "phone")
+    if any(_has_meaningful_value(data.get(field)) for field in support_fields):
+        return True, ""
+
+    social_media = data.get("social_media")
+    if _has_meaningful_value(social_media):
+        normalized_social = _normalize_url(str(social_media))
+        normalized_source = _normalize_url(source_url)
+        if normalized_social != normalized_source:
+            return True, ""
+
+    return False, "missing supporting data (job_title, company, email, phone, or distinct social_media)"
 
 
 def _selector_map_for_fetch(

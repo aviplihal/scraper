@@ -18,7 +18,7 @@ from tools.registry import TOOL_DEFINITIONS, ToolContext, dispatch_tool
 logger = logging.getLogger(__name__)
 
 MODEL      = "qwen3.5:9b"
-MAX_STEPS  = 30
+MAX_STEPS  = 100
 
 
 async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
@@ -41,6 +41,7 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
     print(f"Source    : {source}")
     print(f"Model     : {MODEL}")
     print(f"Job       : {config['job']}")
+    print(f"Lead target: {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads")
     print(f"Max steps : {MAX_STEPS}\n")
 
     for step in range(1, MAX_STEPS + 1):
@@ -56,13 +57,25 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
             )
         except Exception as exc:
             if await _try_automatic_profile_processing(ctx, messages, step):
-                print(
-                    "[agent] Recovered from Ollama tool-call failure by automatically processing "
-                    "outstanding profile pages.",
-                    flush=True,
-                )
-                run_result["status"] = "completed"
-                run_result["stop_reason"] = "Recovered from Ollama tool-call failure using automatic profile processing."
+                if _lead_target_reached(ctx):
+                    print(
+                        "[agent] Recovered from Ollama tool-call failure by automatically "
+                        "processing outstanding profile pages and reaching the lead target.",
+                        flush=True,
+                    )
+                    run_result["status"] = "completed"
+                    run_result["stop_reason"] = _lead_target_stop_reason(ctx)
+                else:
+                    print(
+                        "[agent] Automatic profile processing recovered what it could after an "
+                        "Ollama tool-call failure, but the lead target is still unmet.",
+                        flush=True,
+                    )
+                    run_result["status"] = "completed"
+                    run_result["stop_reason"] = _under_target_stop_reason(
+                        ctx,
+                        "Recovered from Ollama tool-call failure but could not reach the lead target",
+                    )
                 break
             logger.error("Ollama call failed at step %d: %s", step, exc)
             print(f"[agent] ERROR: Ollama call failed — {exc}")
@@ -88,20 +101,38 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                 continue
 
             if await _try_automatic_profile_processing(ctx, messages, step):
-                print(
-                    "[agent] Automatic profile processing completed for outstanding fetched profile pages.",
-                    flush=True,
-                )
-                run_result["status"] = "completed"
-                run_result["stop_reason"] = "Automatic profile processing completed after the agent stopped making tool calls."
+                if _lead_target_reached(ctx):
+                    print(
+                        "[agent] Automatic profile processing completed for outstanding fetched "
+                        "profile pages and reached the lead target.",
+                        flush=True,
+                    )
+                    run_result["status"] = "completed"
+                    run_result["stop_reason"] = _lead_target_stop_reason(ctx)
+                else:
+                    print(
+                        "[agent] Automatic profile processing completed for outstanding fetched "
+                        "profile pages, but the lead target is still unmet.",
+                        flush=True,
+                    )
+                    run_result["status"] = "completed"
+                    run_result["stop_reason"] = _under_target_stop_reason(
+                        ctx,
+                        "Automatic profile processing completed but could not reach the lead target",
+                    )
                 break
 
             print(f"\n[agent] Agent finished after {step} step(s) — no further tool calls.")
             run_result["status"] = "completed"
-            run_result["stop_reason"] = "Agent stopped making tool calls."
+            run_result["stop_reason"] = (
+                _lead_target_stop_reason(ctx)
+                if _lead_target_reached(ctx)
+                else _under_target_stop_reason(ctx, "Agent stopped making tool calls")
+            )
             break
 
         # Execute tool calls and append results
+        reached_target_this_step = False
         for tool_call in message.tool_calls:
             tool_name = tool_call.function.name
             raw_args  = tool_call.function.arguments
@@ -128,10 +159,26 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
             if ctx.failed_url_flag:
                 ctx.failed_url_flag = False
 
+            if _lead_target_reached(ctx):
+                reached_target_this_step = True
+                run_result["status"] = "completed"
+                run_result["stop_reason"] = _lead_target_stop_reason(ctx)
+                print(
+                    f"\n[agent] Lead target reached after step {step} — job stopped.",
+                    flush=True,
+                )
+                break
+
+        if reached_target_this_step:
+            break
+
     else:
         print(f"\n[agent] MAX_STEPS ({MAX_STEPS}) reached — job stopped.")
         run_result["status"] = "max_steps"
-        run_result["stop_reason"] = f"Reached max step limit ({MAX_STEPS})."
+        run_result["stop_reason"] = _under_target_stop_reason(
+            ctx,
+            f"Reached max step limit ({MAX_STEPS})",
+        )
 
     if run_result["status"] == "unknown":
         run_result["status"] = "completed"
@@ -189,6 +236,7 @@ def _build_follow_through_reminder(ctx: ToolContext) -> str:
 
     summary = " ".join(instructions)
     return (
+        f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
         "You have fetched pages that are still unprocessed. "
         "Use list_links on search_results/directory pages, parse_html on profile pages, "
         "and fail_url on blocked, irrelevant, listing-only, or not-found pages. "
@@ -209,7 +257,7 @@ async def _try_automatic_profile_processing(ctx: ToolContext, messages: list[dic
     field_names = list(ctx.client_config.get("fields", {}).keys())
     processed_any = False
 
-    for fetch_id in profile_fetch_ids[:3]:
+    for fetch_id in profile_fetch_ids:
         metadata = ctx.fetch_metadata.get(fetch_id, {})
         url = metadata.get("final_url") or metadata.get("url") or ""
         parse_args = {"fetch_id": fetch_id, "field_names": field_names}
@@ -240,6 +288,8 @@ async def _try_automatic_profile_processing(ctx: ToolContext, messages: list[dic
             messages.append({"role": "tool", "content": fail_result_str})
 
         processed_any = True
+        if _lead_target_reached(ctx):
+            break
 
     return processed_any
 
@@ -253,3 +303,34 @@ def _looks_saveable_name(value: object) -> bool:
         return False
     banned = {"senior software engineer", "software engineer", "developer", "engineer"}
     return value.lower() not in banned
+
+
+def _lead_target(ctx: ToolContext) -> int:
+    """Return the configured viable lead target for this run."""
+    return int(ctx.client_config["min_leads"])
+
+
+def _saved_lead_count(ctx: ToolContext) -> int:
+    """Return how many viable new leads were saved in this run."""
+    return int(getattr(ctx.sheets_writer, "saved_count", 0))
+
+
+def _lead_target_reached(ctx: ToolContext) -> bool:
+    """Return True once the run has saved enough viable new leads."""
+    return _saved_lead_count(ctx) >= _lead_target(ctx)
+
+
+def _lead_target_stop_reason(ctx: ToolContext) -> str:
+    """Build a success stop reason once the viable lead target is met."""
+    return (
+        f"Reached lead target with {_saved_lead_count(ctx)}/{_lead_target(ctx)} "
+        "viable new leads saved."
+    )
+
+
+def _under_target_stop_reason(ctx: ToolContext, prefix: str) -> str:
+    """Build a consistent incomplete stop reason when the target is unmet."""
+    return (
+        f"{prefix} before reaching the lead target "
+        f"({_saved_lead_count(ctx)}/{_lead_target(ctx)} viable new leads saved)."
+    )

@@ -4,6 +4,7 @@
   "job_title": "Senior Software Engineer",
   "area": "San Francisco Bay Area",
   "website": "https://github.com",
+  "min_leads": 3,
   "sources": ["web"],
   "fields": {
     "name": "Full name of the person",

@@ -28,6 +28,22 @@ logging.basicConfig(
 from agent.runner import run_job  # noqa: E402 — import after dotenv
 
 
+def _validate_config(config: dict, client_arg: str) -> None:
+    """Validate required runtime config before starting a job."""
+    if config.get("client_id") != client_arg:
+        print(
+            f"Warning: config client_id '{config.get('client_id')}' "
+            f"does not match --client '{client_arg}'.",
+        )
+
+    min_leads = config.get("min_leads")
+    if isinstance(min_leads, bool) or not isinstance(min_leads, int) or min_leads < 1:
+        raise ValueError(
+            "client config must include a positive integer 'min_leads' "
+            "so the job knows how many viable leads to target before stopping."
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Lead generation job runner")
     parser.add_argument(
@@ -55,14 +71,12 @@ def main() -> None:
     with open(config_path) as f:
         config = json.load(f)
 
-    if config.get("client_id") != args.client:
-        print(
-            f"Warning: config client_id '{config.get('client_id')}' "
-            f"does not match --client '{args.client}'.",
-        )
-
     try:
+        _validate_config(config, args.client)
         asyncio.run(run_job(config, args.source))
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\n[run_job] Interrupted by user.")
         sys.exit(0)

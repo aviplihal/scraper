@@ -121,19 +121,24 @@ def _print_run_summary(
     run_result: dict,
 ) -> None:
     """Print a concise end-of-run summary with the output location."""
-    summary_status = _derive_summary_status(writer, run_result)
+    summary_status = _derive_summary_status(config, writer, run_result)
+    lead_target = int(config["min_leads"])
+    target_reached = writer.saved_count >= lead_target
 
     print("\n=== Job Summary ===")
     print(f"Status     : {summary_status}")
     print(f"Client     : {config['client_id']}")
     print(f"Source     : {source}")
     print(f"Output DB  : {writer.db_path}")
+    print(f"Lead target: {lead_target}")
     print(f"Steps run  : {run_result['steps_run']}")
     print(f"Tool calls : {ctx.tool_call_count}")
     print(f"Pages tried: {ctx.fetch_count}")
     print(f"Fetch errs : {ctx.fetch_error_count}")
-    print(f"Saved new  : {writer.saved_count}")
+    print(f"Viable saved: {writer.saved_count}")
+    print(f"Rejected weak: {ctx.rejected_weak_count}")
     print(f"Duplicates : {writer.duplicate_count}")
+    print(f"Target reached: {'yes' if target_reached else 'no'}")
     print(f"Failed URLs: {len(ctx.failed_urls)}")
     print(f"Why stop   : {run_result['stop_reason']}")
 
@@ -177,15 +182,13 @@ def _print_run_summary(
     print(f"  - Database file: {writer.db_path}")
 
 
-def _derive_summary_status(writer: StorageWriter, run_result: dict) -> str:
+def _derive_summary_status(config: dict, writer: StorageWriter, run_result: dict) -> str:
     """Map raw run results to a quick human-readable status."""
     if run_result["status"] == "error":
         return "ERROR"
-    if writer.saved_count > 0:
+    if writer.saved_count >= int(config["min_leads"]):
         return "SUCCESS"
-    if run_result["status"] == "max_steps":
-        return "INCOMPLETE"
-    return "NO RESULTS"
+    return "INCOMPLETE"
 
 
 def _target_domain_for_config(config: dict) -> str | None:

@@ -28,6 +28,8 @@ think briefly, call a tool, observe the result, think again.
 
 5. **Save one row per lead with save_result.**
    Include null for fields you could not find. Do not omit fields.
+   Only save minimally viable leads: a person identifier in `name` plus at least one of
+   `job_title`, `company`, `email`, `phone`, or `social_media`.
 
 6. **Use fail_url for any URL you cannot process.**
    Call fail_url when:
@@ -59,6 +61,9 @@ Log each site you choose by calling it.
     Do not save directly from search results, directories, or list pages.
     If a profile exposes only a username/handle and not a separate full name, the username is still a valid lead identifier.
 
+12. **Keep working until the configured lead target is reached or useful work is exhausted.**
+    Do not finish early just because you found a few leads if the target is still unmet.
+
 ## Required workflow
 
 For each URL you consider:
@@ -70,7 +75,7 @@ For each URL you consider:
 4. If page_kind is profile:
    call parse_html(fetch_id, field_names=[...])
 5. If parse_html yields a plausible real person:
-   call save_result(url, data)
+   call save_result(url, data) only if it is minimally viable
 6. If blocked, irrelevant, empty, or not a person-lead source:
    call fail_url(url, reason)
 
@@ -96,6 +101,7 @@ def build_user_prompt(config: dict, source: str) -> str:
     job_title = config["job_title"]
     area      = config.get("area", "NA")
     website   = config.get("website", "NA")
+    min_leads = config["min_leads"]
     fields    = config.get("fields", {})
 
     area_instruction = (
@@ -137,6 +143,10 @@ def build_user_prompt(config: dict, source: str) -> str:
         f"## Location\n{area_instruction}\n\n"
         f"## Target website\n{site_instruction}\n\n"
         f"## Source\n{source_instruction}\n\n"
+        f"## Lead target\nSave at least **{min_leads}** minimally viable new leads in this run. "
+        "A minimally viable lead must have a person identifier in `name` plus at least one of "
+        "`job_title`, `company`, `email`, `phone`, or `social_media`. "
+        "Do not finish early below this target unless no useful work remains.\n\n"
         f"## Fields to extract\nExtract exactly these fields (return null if not found):\n{fields_block}\n\n"
         "Goal: find public person leads we can market to. Use search/list pages for discovery, then parse detail/profile pages before saving."
     )

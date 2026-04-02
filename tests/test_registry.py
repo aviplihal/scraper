@@ -10,8 +10,13 @@ class _DummyWriter:
         self.saved_count = 0
         self.duplicate_count = 0
         self.saved_rows: list[dict] = []
+        self._saved_urls: set[str] = set()
 
     async def append_row(self, url: str, data: dict, scrape_status: str = "ok") -> str:  # noqa: ARG002
+        if url in self._saved_urls:
+            self.duplicate_count += 1
+            return "duplicate"
+        self._saved_urls.add(url)
         self.saved_count += 1
         self.saved_rows.append({"url": url, "data": data})
         return "saved"
@@ -21,7 +26,7 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
     async def test_web_mode_rejects_social_media_urls(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
-            client_config={"client_id": "test", "website": "NA"},
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
             sheets_writer=writer,
             source_mode="web",
         )
@@ -38,7 +43,7 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
     async def test_parse_html_rejects_search_pages(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
-            client_config={"client_id": "test", "website": "NA"},
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
             sheets_writer=writer,
             source_mode="web",
         )
@@ -66,6 +71,7 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
             client_config={
                 "client_id": "test",
                 "website": "https://github.com",
+                "min_leads": 1,
                 "fields": {
                     "name": "Full name",
                     "job_title": "Title",
@@ -114,6 +120,7 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
             client_config={
                 "client_id": "test",
                 "website": "https://github.com",
+                "min_leads": 1,
                 "fields": {
                     "name": "Full name",
                     "job_title": "Title",
@@ -161,6 +168,7 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
             client_config={
                 "client_id": "test",
                 "website": "https://github.com",
+                "min_leads": 1,
                 "fields": {
                     "name": "Full name",
                     "job_title": "Title",
@@ -199,6 +207,74 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "saved")
         self.assertEqual(writer.saved_rows[0]["url"], "https://github.com/Big-Silver")
         self.assertEqual(writer.saved_rows[0]["data"]["name"], "Big-Silver")
+
+    async def test_save_result_rejects_name_only_row(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        result = await dispatch_tool(
+            "save_result",
+            {"url": "https://example.com/alice", "data": {"name": "Alice Smith"}},
+            ctx,
+        )
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(writer.saved_count, 0)
+        self.assertEqual(ctx.rejected_weak_count, 1)
+
+    async def test_save_result_accepts_name_plus_job_title(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        result = await dispatch_tool(
+            "save_result",
+            {
+                "url": "https://example.com/alice",
+                "data": {"name": "Alice Smith", "job_title": "CTO"},
+            },
+            ctx,
+        )
+
+        self.assertEqual(result["status"], "saved")
+        self.assertEqual(writer.saved_count, 1)
+
+    async def test_duplicate_saved_row_does_not_increment_saved_count(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 2},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        first = await dispatch_tool(
+            "save_result",
+            {
+                "url": "https://example.com/alice",
+                "data": {"name": "Alice Smith", "job_title": "CTO"},
+            },
+            ctx,
+        )
+        second = await dispatch_tool(
+            "save_result",
+            {
+                "url": "https://example.com/alice",
+                "data": {"name": "Alice Smith", "job_title": "CTO"},
+            },
+            ctx,
+        )
+
+        self.assertEqual(first["status"], "saved")
+        self.assertEqual(second["status"], "duplicate")
+        self.assertEqual(writer.saved_count, 1)
+        self.assertEqual(writer.duplicate_count, 1)
 
 
 if __name__ == "__main__":
