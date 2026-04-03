@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.loop import (
+    _auto_fail_remaining_non_actionable_pages,
     _build_follow_through_reminder,
     _try_automatic_profile_processing,
     run_agent_loop,
@@ -139,6 +140,47 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
         reminder = _build_follow_through_reminder(ctx)
 
         self.assertIn("saved 2/5 viable leads", reminder)
+
+    def test_follow_through_reminder_requests_suggest_targets_first(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find technical decision makers we can market to",
+                "job_title": "Founder",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 3,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        reminder = _build_follow_through_reminder(ctx)
+
+        self.assertIn("Call suggest_targets first", reminder)
+
+    async def test_auto_fail_remaining_non_actionable_pages_marks_pages_processed(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.fetch_metadata["fetch-1"] = {
+            "url": "https://example.com/jobs",
+            "final_url": "https://example.com/jobs",
+            "title": "Jobs",
+            "page_kind": "job_board",
+            "preview": "Jobs",
+        }
+        ctx.url_to_fetch_id["https://example.com/jobs"] = "fetch-1"
+
+        processed = await _auto_fail_remaining_non_actionable_pages(ctx, [], step=3)
+
+        self.assertTrue(processed)
+        self.assertIn("fetch-1", ctx.processed_fetch_ids)
+        self.assertEqual(ctx.failed_urls[0]["url"], "https://example.com/jobs")
 
     async def test_run_stops_immediately_when_target_reached(self) -> None:
         writer = _DummyWriter()

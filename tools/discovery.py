@@ -37,6 +37,31 @@ _JOB_MARKERS = (
     "best tech jobs",
 )
 
+_COMPANY_DIRECTORY_MARKERS = (
+    "startup directory",
+    "company directory",
+    "portfolio companies",
+    "browse companies",
+    "startup database",
+)
+
+_COMPANY_PAGE_MARKERS = (
+    "our team",
+    "leadership team",
+    "management team",
+    "founding team",
+    "meet the team",
+    "about us",
+)
+
+_ARTICLE_MARKERS = (
+    "technology news",
+    "startup and technology news",
+    "latest news",
+    "editorial",
+    "press release",
+)
+
 _SEARCH_MARKERS = (
     "search results",
     "results found",
@@ -50,10 +75,29 @@ _DIRECTORY_SEGMENTS = {
     "users",
     "members",
     "directory",
-    "team",
-    "staff",
     "experts",
     "profiles",
+}
+
+_COMPANY_DIRECTORY_SEGMENTS = {
+    "companies",
+    "company",
+    "startups",
+    "portfolio",
+    "organizations",
+    "organization",
+    "ventures",
+}
+
+_COMPANY_PAGE_SEGMENTS = {
+    "team",
+    "about",
+    "leadership",
+    "management",
+    "staff",
+    "founders",
+    "bios",
+    "bio",
 }
 
 _PROFILE_SEGMENTS = {
@@ -105,6 +149,33 @@ _STOP_PATH_SEGMENTS = {
     "careers",
     "jobs",
     "search",
+}
+
+_PEOPLE_DISCOVERY_TERMS = {
+    "team",
+    "leadership",
+    "management",
+    "staff",
+    "founders",
+    "speaker",
+    "speakers",
+    "bios",
+    "bio",
+    "people",
+    "members",
+}
+
+_LOW_VALUE_TERMS = {
+    "jobs",
+    "careers",
+    "pricing",
+    "news",
+    "blog",
+    "product",
+    "companies",
+    "funding",
+    "search",
+    "login",
 }
 
 _GITHUB_RESERVED_SEGMENTS = {
@@ -173,11 +244,23 @@ def classify_page(url: str, final_url: str, html: str) -> PageInfo:
     if _looks_like_search_results(path, query, title_lower, text_lower):
         return PageInfo(final_url=final_url or url, title=title, page_kind="search_results")
 
+    if _looks_like_company_directory(path_segments, title_lower, text_lower):
+        return PageInfo(final_url=final_url or url, title=title, page_kind="company_directory")
+
     if _looks_like_directory(path_segments, title_lower, text_lower):
         return PageInfo(final_url=final_url or url, title=title, page_kind="directory")
 
     if _looks_like_profile(host, path_segments, soup, title_lower, text_lower):
         return PageInfo(final_url=final_url or url, title=title, page_kind="profile")
+
+    if _looks_like_company_page(path_segments, title_lower, text_lower):
+        return PageInfo(final_url=final_url or url, title=title, page_kind="company_page")
+
+    if _looks_like_article_or_news(host, path_segments, title_lower, text_lower):
+        return PageInfo(final_url=final_url or url, title=title, page_kind="article_or_news")
+
+    if _looks_like_landing_page(path_segments, title_lower, text_lower):
+        return PageInfo(final_url=final_url or url, title=title, page_kind="landing_page")
 
     return PageInfo(final_url=final_url or url, title=title, page_kind="unknown")
 
@@ -254,11 +337,22 @@ def _looks_like_search_results(path: str, query: str, title_lower: str, text_low
 def _looks_like_directory(path_segments: list[str], title_lower: str, text_lower: str) -> bool:
     if len(path_segments) == 1 and path_segments[0] in _DIRECTORY_SEGMENTS:
         return True
-    if any(phrase in title_lower for phrase in ("directory", "members", "team", "staff", "people")):
+    if any(phrase in title_lower for phrase in ("directory", "members", "people")):
         return True
     return any(
         phrase in text_lower
-        for phrase in ("people directory", "staff directory", "team directory", "team members", "browse people")
+        for phrase in ("people directory", "staff directory", "team directory", "browse people")
+    )
+
+
+def _looks_like_company_directory(path_segments: list[str], title_lower: str, text_lower: str) -> bool:
+    if len(path_segments) == 1 and path_segments[0] in _COMPANY_DIRECTORY_SEGMENTS:
+        return True
+    if _contains_marker(title_lower, text_lower, _COMPANY_DIRECTORY_MARKERS):
+        return True
+    return any(
+        phrase in text_lower
+        for phrase in ("company directory", "startup directory", "portfolio companies", "browse startups")
     )
 
 
@@ -272,6 +366,9 @@ def _looks_like_profile(
     if host == "github.com" and len(path_segments) == 1:
         return path_segments[0] not in _GITHUB_RESERVED_SEGMENTS
 
+    if len(path_segments) == 1 and path_segments[0] in _COMPANY_PAGE_SEGMENTS:
+        return False
+
     if soup.select_one("meta[property='og:type'][content='profile']"):
         return True
 
@@ -281,12 +378,58 @@ def _looks_like_profile(
     if soup.select_one("[itemprop='name']") or soup.select_one("[itemprop='worksFor']"):
         return True
 
-    if len(path_segments) >= 2 and any(segment in _PROFILE_SEGMENTS for segment in path_segments):
+    if (
+        len(path_segments) >= 2
+        and any(segment in _PROFILE_SEGMENTS for segment in path_segments)
+        and path_segments[-1] not in _COMPANY_PAGE_SEGMENTS
+    ):
         return True
 
     has_person_like_title = any(word in title_lower for word in ("founder", "engineer", "developer", "marketer"))
     has_contact_or_org_signal = "@" in text_lower or "company" in text_lower or "works at" in text_lower
     return has_person_like_title and has_contact_or_org_signal
+
+
+def _looks_like_company_page(path_segments: list[str], title_lower: str, text_lower: str) -> bool:
+    if len(path_segments) == 1 and path_segments[0] in _COMPANY_PAGE_SEGMENTS:
+        return True
+    if len(path_segments) >= 2 and path_segments[0] in _COMPANY_DIRECTORY_SEGMENTS:
+        return True
+    if any(segment in _COMPANY_PAGE_SEGMENTS for segment in path_segments):
+        return True
+    if _contains_marker(title_lower, text_lower, _COMPANY_PAGE_MARKERS):
+        return True
+    return any(phrase in title_lower for phrase in ("team", "leadership", "management", "about"))
+
+
+def _looks_like_article_or_news(
+    host: str,
+    path_segments: list[str],
+    title_lower: str,
+    text_lower: str,
+) -> bool:
+    if host in {"techcrunch.com", "venturebeat.com"}:
+        return True
+    if any(segment in {"blog", "news", "press", "article", "articles"} for segment in path_segments):
+        return True
+    return _contains_marker(title_lower, text_lower, _ARTICLE_MARKERS)
+
+
+def _looks_like_landing_page(path_segments: list[str], title_lower: str, text_lower: str) -> bool:
+    if path_segments:
+        return False
+    return not any(
+        phrase in title_lower or phrase in text_lower
+        for phrase in (
+            "directory",
+            "people",
+            "team",
+            "leadership",
+            "staff",
+            "founder",
+            "speaker",
+        )
+    )
 
 
 def _select_anchors(soup: BeautifulSoup, base_url: str, selector: str | None):
@@ -340,8 +483,20 @@ def _score_link(anchor, normalized_url: str, text: str, base_url: str) -> int:
     if any(segment.lower() in _PROFILE_SEGMENTS for segment in path_segments):
         score += 7
 
+    if any(term in text_lower for term in _PEOPLE_DISCOVERY_TERMS):
+        score += 6
+
+    if any(segment.lower() in _PEOPLE_DISCOVERY_TERMS for segment in path_segments):
+        score += 6
+
     if any(word in text_lower for word in ("founder", "engineer", "developer", "marketer", "ceo", "cto")):
         score += 2
+
+    if any(term in text_lower for term in _LOW_VALUE_TERMS):
+        score -= 4
+
+    if any(segment.lower() in _LOW_VALUE_TERMS for segment in path_segments):
+        score -= 8
 
     if len(path_segments) == 0:
         score -= 10

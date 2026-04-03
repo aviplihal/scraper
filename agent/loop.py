@@ -13,7 +13,7 @@ import logging
 import ollama
 
 from agent.prompts import SYSTEM_PROMPT, build_user_prompt
-from tools.registry import TOOL_DEFINITIONS, ToolContext, dispatch_tool
+from tools.registry import TOOL_DEFINITIONS, ToolContext, _curated_target_pool_exhausted, dispatch_tool
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,10 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                 print(f"[agent] Reminder: {reminder}", flush=True)
                 messages.append({"role": "user", "content": reminder})
                 continue
+
+            if await _auto_fail_remaining_non_actionable_pages(ctx, messages, step):
+                if _should_request_follow_through(ctx):
+                    continue
 
             if await _try_automatic_profile_processing(ctx, messages, step):
                 if _lead_target_reached(ctx):
@@ -200,7 +204,7 @@ def _fmt_args(args: dict) -> str:
 
 def _should_request_follow_through(ctx: ToolContext) -> bool:
     """Return True when fetched pages remain unprocessed."""
-    return bool(_unprocessed_fetch_ids(ctx))
+    return _needs_target_suggestions(ctx) or bool(_unprocessed_fetch_ids(ctx))
 
 
 def _unprocessed_fetch_ids(ctx: ToolContext) -> list[str]:
@@ -214,13 +218,20 @@ def _unprocessed_fetch_ids(ctx: ToolContext) -> list[str]:
 
 def _build_follow_through_reminder(ctx: ToolContext) -> str:
     """Build a targeted reminder telling the model how to process fetched pages."""
+    if _needs_target_suggestions(ctx):
+        return (
+            f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
+            "You are in broad web mode with website=NA. Call suggest_targets first to get the curated "
+            "starter target list before fetching pages."
+        )
+
     instructions: list[str] = []
     for fetch_id in _unprocessed_fetch_ids(ctx)[:3]:
         metadata = ctx.fetch_metadata.get(fetch_id, {})
         page_kind = metadata.get("page_kind", "unknown")
         url = metadata.get("final_url") or metadata.get("url") or "unknown URL"
 
-        if page_kind in {"search_results", "directory"}:
+        if page_kind in {"search_results", "directory", "company_directory", "company_page"}:
             action = (
                 f"{fetch_id} ({page_kind}) {url}: call list_links on this page to discover candidate profile/detail URLs."
             )
@@ -294,6 +305,38 @@ async def _try_automatic_profile_processing(ctx: ToolContext, messages: list[dic
     return processed_any
 
 
+async def _auto_fail_remaining_non_actionable_pages(
+    ctx: ToolContext,
+    messages: list[dict],
+    step: int,
+) -> bool:
+    """Automatically fail leftover blocked or non-discovery pages before ending a run."""
+    non_actionable_kinds = {"blocked", "job_board", "landing_page", "article_or_news", "not_found"}
+    pending = [
+        fetch_id
+        for fetch_id in _unprocessed_fetch_ids(ctx)
+        if ctx.fetch_metadata.get(fetch_id, {}).get("page_kind") in non_actionable_kinds
+    ]
+    if not pending:
+        return False
+
+    processed_any = False
+    for fetch_id in pending:
+        metadata = ctx.fetch_metadata.get(fetch_id, {})
+        url = metadata.get("final_url") or metadata.get("url") or ""
+        page_kind = metadata.get("page_kind", "unknown")
+        reason = f"Automatic cleanup: {page_kind} page is not a viable discovery target."
+        fail_args = {"url": url, "reason": reason}
+        print(f"[step {step}] → fail_url({_fmt_args(fail_args)}) [auto]", flush=True)
+        fail_result = await dispatch_tool("fail_url", fail_args, ctx)
+        fail_result_str = json.dumps(fail_result, ensure_ascii=False)
+        print(f"[step {step}] ← {fail_result_str[:300]} [auto]", flush=True)
+        messages.append({"role": "tool", "content": fail_result_str})
+        processed_any = True
+
+    return processed_any
+
+
 def _looks_saveable_name(value: object) -> bool:
     """Return True when an extracted name is good enough to save."""
     if not isinstance(value, str):
@@ -330,7 +373,21 @@ def _lead_target_stop_reason(ctx: ToolContext) -> str:
 
 def _under_target_stop_reason(ctx: ToolContext, prefix: str) -> str:
     """Build a consistent incomplete stop reason when the target is unmet."""
+    if _curated_target_pool_exhausted(ctx):
+        return (
+            "Curated target pool exhausted before reaching the lead target "
+            f"({_saved_lead_count(ctx)}/{_lead_target(ctx)} viable new leads saved)."
+        )
     return (
         f"{prefix} before reaching the lead target "
         f"({_saved_lead_count(ctx)}/{_lead_target(ctx)} viable new leads saved)."
+    )
+
+
+def _needs_target_suggestions(ctx: ToolContext) -> bool:
+    """Return True when broad web mode has not yet requested curated targets."""
+    return (
+        ctx.source_mode == "web"
+        and str(ctx.client_config.get("website", "NA")).upper() == "NA"
+        and not ctx.suggest_targets_called
     )

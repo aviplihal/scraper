@@ -2,7 +2,7 @@
 
 import unittest
 
-from tools.registry import ToolContext, dispatch_tool
+from tools.registry import DomainOutcome, ToolContext, _record_domain_failure, _record_fetch_outcome, dispatch_tool
 
 
 class _DummyWriter:
@@ -23,6 +23,78 @@ class _DummyWriter:
 
 
 class RegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_suggest_targets_returns_curated_leadership_targets(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find technical decision makers we can market to",
+                "job_title": "Founder",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 1,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        result = await dispatch_tool("suggest_targets", {"limit": 4}, ctx)
+
+        self.assertEqual(result["strategy"], "leadership_people")
+        urls = [target["url"] for target in result["targets"]]
+        self.assertIn("https://www.ycombinator.com/founders", urls)
+        self.assertNotIn("https://www.crunchbase.com/people", urls)
+        self.assertTrue(ctx.suggest_targets_called)
+
+    async def test_broad_mode_rejects_fetch_before_suggest_targets(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find technical decision makers we can market to",
+                "job_title": "Founder",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 1,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        result = await dispatch_tool(
+            "fetch_page",
+            {"url": "https://www.crunchbase.com/people", "needs_javascript": True},
+            ctx,
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("suggest_targets", result["error"])
+
+    async def test_broad_mode_rejects_domain_outside_curated_pool(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find technical decision makers we can market to",
+                "job_title": "Founder",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 1,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        await dispatch_tool("suggest_targets", {"limit": 4}, ctx)
+        result = await dispatch_tool(
+            "fetch_page",
+            {"url": "https://www.crunchbase.com/people", "needs_javascript": True},
+            ctx,
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("outside the curated target pool", result["error"])
+
     async def test_web_mode_rejects_social_media_urls(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
@@ -301,6 +373,39 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["url"], "https://www.crunchbase.com/people")
         self.assertIn("fetch-5", ctx.processed_fetch_ids)
+
+    async def test_blocked_fetch_bans_domain_for_run(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"crunchbase.com"}
+        _record_fetch_outcome("fetch-6", "crunchbase.com", "blocked", ctx)
+
+        result = await dispatch_tool(
+            "fetch_page",
+            {"url": "https://www.crunchbase.com/people/search", "needs_javascript": True},
+            ctx,
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("banned for this run", result["error"])
+
+    def test_two_irrelevant_failures_ban_domain_for_run(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        _record_domain_failure("https://example.com/news", "landing page", ctx)
+        _record_domain_failure("https://example.com/blog", "article or news page", ctx)
+
+        self.assertTrue(ctx.domain_outcomes["example.com"].banned_for_run)
 
 
 if __name__ == "__main__":

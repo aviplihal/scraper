@@ -22,7 +22,8 @@ think briefly, call a tool, observe the result, think again.
    Do not output long free-form reasoning without taking tool actions.
 
 4. **Use fetch_page to get a page, then choose the correct next tool.**
-   - For search, directory, and listing pages: use list_links
+   - In broad web mode when website is NA: call suggest_targets before your first fetch
+   - For search, directory, company_directory, and company_page pages: use list_links
    - For detail/profile pages: use parse_html with field_names
    Always call fetch_page before list_links or parse_html.
 
@@ -46,6 +47,7 @@ think briefly, call a tool, observe the result, think again.
 8. **When website is NA:** reason about which websites are most relevant for the given \
 job title, industry, and area. These describe the target people you want to market to, not jobs you want to fill. \
 Target public non-social websites that can actually contain person-level results. \
+In web mode, start from the curated target list returned by suggest_targets instead of inventing domains ad hoc. \
 Log each site you choose by calling it.
    In web-only runs, avoid choosing social-media sites.
 
@@ -72,6 +74,8 @@ For each URL you consider:
 2. Inspect page_kind and preview
 3. If page_kind is search_results or directory:
    call list_links(fetch_id, limit=5, ...)
+4. If page_kind is company_directory or company_page:
+   call list_links(fetch_id, limit=5, ...) and follow team/leadership/people links
 4. If page_kind is profile:
    call parse_html(fetch_id, field_names=[...])
 5. If parse_html yields a plausible real person:
@@ -86,9 +90,11 @@ For each URL you consider:
 - Do not brainstorm implementation ideas.
 - Do not keep retrying the same kind of irrelevant site.
 - When website is specified, stay on that website/domain.
+- In website=NA web mode, call suggest_targets first and stay within the curated target pool for the run.
 - After list_links, fetch and process only 1 to 2 candidate profile pages at a time before asking for more links.
 - If a page is clearly a job board listing page instead of a people directory, mark it failed and move on.
 - If a page is blocked by captcha or "Just a moment" protection, mark it failed and move on.
+- Company/team/about/leadership pages are valid discovery pages, but startup homepages, company catalogs, and news homepages are not valid starter targets.
 - Prefer concrete progress over commentary.
 
 Work systematically. Do not revisit URLs you have already processed.
@@ -113,9 +119,10 @@ def build_user_prompt(config: dict, source: str) -> str:
     if website.upper() == "NA":
         site_instruction = (
             "No target website was specified. Reason about which websites are most relevant "
-            f"for finding '{job_title}' people leads for this marketing job and generate your own target list. "
-            "Log every site you choose. "
-            "If source=web, avoid social-media websites and prefer public non-social sites."
+            f"for finding '{job_title}' people leads for this marketing job. "
+            "If source=web, begin by calling suggest_targets and work from that curated starter list. "
+            "Stay within that curated target pool instead of inventing random domains. "
+            "Prefer public non-social sites and company/team/leadership discovery pages that can lead to real people."
         )
     else:
         site_instruction = (
