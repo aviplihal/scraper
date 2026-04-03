@@ -204,7 +204,11 @@ def _fmt_args(args: dict) -> str:
 
 def _should_request_follow_through(ctx: ToolContext) -> bool:
     """Return True when fetched pages remain unprocessed."""
-    return _needs_target_suggestions(ctx) or bool(_unprocessed_fetch_ids(ctx))
+    return (
+        _needs_target_suggestions(ctx)
+        or _needs_target_fetch_follow_through(ctx)
+        or bool(_unprocessed_fetch_ids(ctx))
+    )
 
 
 def _unprocessed_fetch_ids(ctx: ToolContext) -> list[str]:
@@ -223,6 +227,21 @@ def _build_follow_through_reminder(ctx: ToolContext) -> str:
             f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
             "You are in broad web mode with website=NA. Call suggest_targets first to get the curated "
             "starter target list before fetching pages."
+        )
+
+    if _needs_target_fetch_follow_through(ctx):
+        pending_targets = []
+        for target in ctx.suggested_targets[:3]:
+            url = str(target.get("url", ""))
+            normalized = url.strip()
+            if normalized and normalized not in ctx.visited_urls:
+                pending_targets.append(url)
+        preview = " ".join(pending_targets[:3])
+        return (
+            f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
+            "You already called suggest_targets, but you have not fetched enough curated starter targets yet. "
+            "Fetch 1 to 2 of the highest-priority suggested targets now and continue from their results. "
+            f"Suggested starter URLs: {preview}"
         )
 
     instructions: list[str] = []
@@ -391,3 +410,21 @@ def _needs_target_suggestions(ctx: ToolContext) -> bool:
         and str(ctx.client_config.get("website", "NA")).upper() == "NA"
         and not ctx.suggest_targets_called
     )
+
+
+def _needs_target_fetch_follow_through(ctx: ToolContext) -> bool:
+    """Return True when broad-mode curated targets were suggested but not yet fetched."""
+    if not (
+        ctx.source_mode == "web"
+        and str(ctx.client_config.get("website", "NA")).upper() == "NA"
+        and ctx.suggest_targets_called
+        and ctx.suggested_target_urls
+    ):
+        return False
+
+    visited = ctx.visited_urls
+    fetched_targets = sum(1 for url in ctx.suggested_target_urls if url in visited)
+    if fetched_targets >= min(2, len(ctx.suggested_target_urls)):
+        return False
+
+    return not _lead_target_reached(ctx)

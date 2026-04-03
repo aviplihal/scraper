@@ -160,6 +160,35 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Call suggest_targets first", reminder)
 
+    def test_follow_through_reminder_requests_fetch_after_suggest_targets(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find technical decision makers we can market to",
+                "job_title": "Founder",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 3,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.suggest_targets_called = True
+        ctx.suggested_targets = [
+            {"url": "https://github.com/search?q=Founder&type=users", "priority": 100},
+            {"url": "https://www.ycombinator.com/founders", "priority": 90},
+        ]
+        ctx.suggested_target_urls = {
+            "https://github.com/search?q=Founder&type=users",
+            "https://www.ycombinator.com/founders",
+        }
+
+        reminder = _build_follow_through_reminder(ctx)
+
+        self.assertIn("Fetch 1 to 2 of the highest-priority suggested targets now", reminder)
+        self.assertIn("https://github.com/search?q=Founder&type=users", reminder)
+
     async def test_auto_fail_remaining_non_actionable_pages_marks_pages_processed(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
