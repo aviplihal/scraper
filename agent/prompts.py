@@ -22,7 +22,7 @@ think briefly, call a tool, observe the result, think again.
    Do not output long free-form reasoning without taking tool actions.
 
 4. **Use fetch_page to get a page, then choose the correct next tool.**
-   - In broad web mode when website is NA: call suggest_targets before your first fetch
+   - When website is NA in web, human_emulator, or all mode: call suggest_targets before your first fetch
    - For search, directory, company_directory, and company_page pages: use list_links
    - For detail/profile pages: use parse_html with field_names
    Always call fetch_page before list_links or parse_html.
@@ -44,16 +44,14 @@ think briefly, call a tool, observe the result, think again.
    - Prefer public profile pages, team pages, staff pages, directories, portfolio sites, and public user profiles
    - Avoid wasting steps on generic job listings that do not contain person-level leads
 
-8. **When website is NA:** reason about which websites are most relevant for the given \
+8. **When website is NA:** reason about which websites and enabled social platforms are most relevant for the given \
 job title, industry, and area. These describe the target people you want to market to, not jobs you want to fill. \
-Target public non-social websites that can actually contain person-level results. \
-In web mode, start from the curated target list returned by suggest_targets instead of inventing domains ad hoc. \
-Log each site you choose by calling it.
-   In web-only runs, avoid choosing social-media sites.
+Start from the curated target list returned by suggest_targets instead of inventing domains ad hoc. \
+Log each site you choose by calling it. In web-only runs, avoid choosing social-media sites.
 
-9. **For social-media URLs** (LinkedIn, Facebook, Instagram, Twitter/X):
+9. **For social-media URLs** (LinkedIn and X in this version):
    Call fetch_page normally — the system will automatically route them to the \
-   human emulator.
+   human emulator and handle code-driven login/session logic.
    If the source is `web`, do not choose social-media sites as targets.
 
 10. **Respect the field schema exactly.**
@@ -116,11 +114,13 @@ def build_user_prompt(config: dict, source: str) -> str:
         else "No geographic filter — search globally."
     )
 
+    social_platforms = [str(item).strip() for item in config.get("social_platforms", []) if str(item).strip()]
     if website.upper() == "NA":
         site_instruction = (
             "No target website was specified. Reason about which websites are most relevant "
             f"for finding '{job_title}' people leads for this marketing job. "
             "If source=web, begin by calling suggest_targets and work from that curated starter list. "
+            "If source=human_emulator or source=all, also use suggest_targets for the enabled social platforms. "
             "Stay within that curated target pool instead of inventing random domains. "
             "Prefer public non-social sites and company/team/leadership discovery pages that can lead to real people."
         )
@@ -136,10 +136,10 @@ def build_user_prompt(config: dict, source: str) -> str:
             "Do not target LinkedIn, Facebook, Instagram, Twitter/X, or other social-media sites in this mode."
         ),
         "human_emulator": (
-            "Use the human emulator source. Process the social-media profiles in the queue. "
-            "Call fetch_page with each profile URL and the system will route them correctly."
+            "Use the human emulator source. Call suggest_targets first, then process only the enabled social-media platforms. "
+            "Call fetch_page with social URLs and the system will route them correctly."
         ),
-        "all": "Use all available sources — web scraping and social-media emulation.",
+        "all": "Use all available sources — web scraping and enabled social-media emulation from the curated target list.",
     }.get(source, "Use all available sources.")
 
     fields_block = "\n".join(f"  - {k}: {v}" for k, v in fields.items())
@@ -150,6 +150,7 @@ def build_user_prompt(config: dict, source: str) -> str:
         f"## Location\n{area_instruction}\n\n"
         f"## Target website\n{site_instruction}\n\n"
         f"## Source\n{source_instruction}\n\n"
+        f"## Enabled social platforms\n{', '.join(social_platforms) if social_platforms else 'None configured'}\n\n"
         f"## Lead target\nSave at least **{min_leads}** minimally viable new leads in this run. "
         "A minimally viable lead must have a person identifier in `name` plus at least one of "
         "`job_title`, `company`, `email`, `phone`, or `social_media`. "

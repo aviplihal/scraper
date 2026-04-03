@@ -1,11 +1,12 @@
 """Tool registry: tool definitions plus the async dispatcher.
 
-Five tools are exposed to the agent:
-  1. fetch_page     — fetch a URL and classify the page
-  2. list_links     — extract candidate navigation/profile links from a page
-  3. parse_html     — extract fields from previously fetched HTML via CSS selectors
-  4. save_result    — write a lead row to the client's SQLite database
-  5. fail_url       — log a URL failure and skip it
+Six tools are exposed to the agent:
+  1. suggest_targets — return ranked starter targets for the current run
+  2. fetch_page      — fetch a URL and classify the page
+  3. list_links      — extract candidate navigation/profile links from a page
+  4. parse_html      — extract fields from previously fetched HTML via CSS selectors
+  5. save_result     — write a lead row to the client's SQLite database
+  6. fail_url        — log a URL failure and skip it
 
 A ToolContext object is passed to every tool so they can share state
 (browser, page cache, metadata, crawler state, human emulator, storage writer)
@@ -20,6 +21,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
+from human_emulator.platforms import adapter_for_url
+from human_emulator.social import RestrictionDetected
 from tools.discovery import build_preview, classify_page, extract_links
 from tools.fetcher import smart_fetch
 from tools.parser import parse_fields
@@ -46,6 +49,7 @@ _GENERIC_PROFILE_SELECTORS: dict[str, list[str]] = {
     "company": [".company", ".organization", "[itemprop='worksFor']", ".employer"],
     "email": ["a[href^='mailto:']"],
     "phone": ["a[href^='tel:']"],
+    "website": ["a.website[href]", "a[href][class*='website']", "a[href^='http']"],
     "social_media": [
         "a[href*='linkedin.com']",
         "a[href*='twitter.com']",
@@ -113,6 +117,7 @@ class ToolContext:
     suggested_target_urls: set[str]    = field(default_factory=set)
     allowed_domains: set[str]          = field(default_factory=set)
     target_strategy: str | None        = None
+    social_adapters: dict[str, Any]    = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +398,15 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
                 "url": url,
             }
 
-        ctx.fetch_count += 1
+        broad_mode_rejection = _broad_mode_rejection(url, normalized_url, domain, ctx)
+        if broad_mode_rejection:
+            ctx.fetch_error_count += 1
+            return {"error": broad_mode_rejection, "url": url}
+
+        if ctx.client_config.get("website", "NA").upper() == "NA" and url not in ctx._logged_sites_chosen:
+            ctx._logged_sites_chosen.append(url)
+            logger.info("Agent-chosen target site: %s", url)
+
         result = await _fetch_social_media(url, ctx)
         if "error" in result:
             ctx.fetch_error_count += 1
@@ -467,43 +480,101 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
             "url": url,
         }
 
-    logger.info("Routing social-media URL to human emulator: %s", url)
-    collected: list[dict] = []
+    adapter_cls = adapter_for_url(url)
+    if adapter_cls is None:
+        return {
+            "error": "This social-media platform is not supported yet. Supported platforms are LinkedIn and X.",
+            "url": url,
+        }
 
-    async def on_result(visited_url: str, data: dict) -> None:
-        collected.append(data)
+    platform = adapter_cls.platform
+    enabled_platforms = {
+        str(item).strip().lower()
+        for item in ctx.client_config.get("social_platforms", [])
+        if str(item).strip()
+    }
+    if ctx.source_mode in {"human_emulator", "all"} and not enabled_platforms:
+        return {
+            "error": "No social platforms are enabled for this client. Add 'social_platforms' to the client config.",
+            "url": url,
+        }
+    if enabled_platforms and platform not in enabled_platforms:
+        return {
+            "error": f"Social platform '{platform}' is not enabled for this client.",
+            "url": url,
+        }
 
-    from human_emulator.linkedin import LinkedInEmulator
+    availability = ctx.emulator_state.availability(platform)
+    if availability["status"] in {"missing_credentials", "paused", "unavailable"}:
+        reason = availability["reason"] or availability["status"]
+        return {
+            "error": f"Social platform '{platform}' is currently unavailable: {reason}",
+            "url": url,
+        }
 
-    # Instantiate a short-lived emulator just for this URL
-    context = getattr(ctx.emulator_browser, "_context", None)
-    if context is None:
-        context = await ctx.emulator_browser.start()
-    emulator = LinkedInEmulator(context, ctx.emulator_state, ctx.client_config["client_id"])
-    await emulator.process_profiles([url], on_result)
+    logger.info("Routing social-media URL to human emulator (%s): %s", platform, url)
+    adapter = ctx.social_adapters.get(platform)
+    if adapter is None:
+        context = await ctx.emulator_browser.get_context(platform)
+        adapter = adapter_cls(context, ctx.emulator_state, ctx.client_config["client_id"])
+        ctx.social_adapters[platform] = adapter
 
-    if not collected:
-        return {"error": "Human emulator returned no data.", "url": url}
+    try:
+        fetch_result = await adapter.fetch(url)
+    except RestrictionDetected as exc:
+        ctx.emulator_state.record_restriction(platform)
+        ctx.emulator_state.set_pause_hours(platform, hours=8, reason=str(exc))
+        ctx.emulator_state.set_availability(platform, "paused", str(exc))
+        return {
+            "error": f"Social platform '{platform}' hit a checkpoint and has been paused: {exc}",
+            "url": url,
+        }
+    except Exception as exc:
+        ctx.emulator_state.set_availability(platform, "unavailable", str(exc))
+        return {
+            "error": f"Social fetch failed for platform '{platform}': {exc}",
+            "url": url,
+        }
 
-    data = collected[0]
+    ctx.fetch_count += 1
+    domain = _domain_for_url(fetch_result.final_url or url)
+    ctx.domain_fetch_counts[domain] = ctx.domain_fetch_counts.get(domain, 0) + 1
     fetch_id = str(uuid.uuid4())
-    # Store a synthetic HTML blob of the extracted data for parse_html compatibility
-    fake_html = "<html><body>" + "".join(
-        f"<div class='field-{k}'>{v}</div>" for k, v in data.items() if v
-    ) + "</body></html>"
-    ctx.page_cache[fetch_id] = fake_html
-
-    preview = json.dumps(data, indent=2)
+    ctx.page_cache[fetch_id] = fetch_result.html
+    preview = build_preview(fetch_result.html)
     metadata = {
         "url": url,
-        "final_url": url,
-        "title": data.get("name") or "Social profile",
-        "page_kind": "profile",
+        "final_url": fetch_result.final_url or url,
+        "title": fetch_result.title or "Social profile",
+        "page_kind": fetch_result.page_kind,
         "preview": preview,
+        "platform": platform,
     }
     ctx.fetch_metadata[fetch_id] = metadata
     ctx.url_to_fetch_id[_normalize_url(url)] = fetch_id
-    return {"fetch_id": fetch_id, **metadata, "extracted_data": data}
+    ctx.url_to_fetch_id[_normalize_url(fetch_result.final_url or url)] = fetch_id
+    ctx.visited_urls.add(_normalize_url(url))
+    ctx.visited_urls.add(_normalize_url(fetch_result.final_url or url))
+    _record_fetch_outcome(fetch_id, domain, fetch_result.page_kind, ctx)
+
+    if fetch_result.page_kind == "profile":
+        ctx.emulator_state.mark_visited(fetch_result.final_url or url, platform=platform)
+
+    if fetch_result.extracted_data:
+        if fetch_result.page_kind in {"search_results", "directory"}:
+            profile_urls = [
+                str(item.get("url"))
+                for item in fetch_result.extracted_data.get("results", [])
+                if isinstance(item, dict) and item.get("url")
+            ]
+            if profile_urls:
+                ctx.emulator_state.add_profiles(profile_urls, platform=platform)
+        else:
+            preview = json.dumps(fetch_result.extracted_data, indent=2)
+            metadata["preview"] = preview
+            ctx.fetch_metadata[fetch_id]["preview"] = preview
+
+    return {"fetch_id": fetch_id, **metadata, "extracted_data": fetch_result.extracted_data}
 
 
 def _tool_list_links(
@@ -622,10 +693,10 @@ def _same_or_subdomain(host: str, target_host: str) -> bool:
     return host == target_host or host.endswith(f".{target_host}")
 
 
-def _is_broad_web_mode(ctx: ToolContext) -> bool:
-    """Return True for website=NA web-only runs that need curated target selection."""
+def _uses_curated_target_pool(ctx: ToolContext) -> bool:
+    """Return True when website=NA runs should start from suggest_targets output."""
     return (
-        ctx.source_mode == "web"
+        ctx.source_mode in {"web", "human_emulator", "all"}
         and str(ctx.client_config.get("website", "NA")).upper() == "NA"
         and ctx.target_domain is None
     )
@@ -633,7 +704,7 @@ def _is_broad_web_mode(ctx: ToolContext) -> bool:
 
 def _broad_mode_rejection(url: str, normalized_url: str, domain: str, ctx: ToolContext) -> str | None:
     """Return an error message when broad-mode fetch gating should reject a URL."""
-    if not _is_broad_web_mode(ctx):
+    if not _uses_curated_target_pool(ctx):
         return None
 
     if not ctx.suggest_targets_called:
@@ -765,7 +836,7 @@ def _record_domain_save(url: str, ctx: ToolContext) -> None:
 
 def _curated_target_pool_exhausted(ctx: ToolContext) -> bool:
     """Return True when all suggested starter targets have been consumed or banned."""
-    if not _is_broad_web_mode(ctx) or not ctx.suggest_targets_called:
+    if not _uses_curated_target_pool(ctx) or not ctx.suggest_targets_called:
         return False
 
     for normalized_url in ctx.suggested_target_urls:
@@ -957,6 +1028,13 @@ def _postprocess_extracted_fields(
         if job_title and username and str(job_title).strip() == username:
             result["job_title"] = derived_title
 
+    if domain in {"linkedin.com", "x.com", "twitter.com"}:
+        if "social_media" in requested_fields and not result.get("social_media"):
+            result["social_media"] = final_url
+
+        if "name" in requested_fields and not result.get("name"):
+            result["name"] = _social_handle_from_url(final_url)
+
     return result
 
 
@@ -1004,3 +1082,12 @@ def _looks_like_role_text(value: Any) -> bool:
         "scientist",
     }
     return any(word in lowered for word in role_words)
+
+
+def _social_handle_from_url(url: str) -> str | None:
+    """Return a username or handle from a social profile URL."""
+    parsed = urlparse(url)
+    parts = [segment for segment in parsed.path.split("/") if segment]
+    if len(parts) == 1:
+        return parts[0]
+    return None

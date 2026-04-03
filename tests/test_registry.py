@@ -1,7 +1,9 @@
 """Tests for registry guardrails and tool dispatch behavior."""
 
 import unittest
+from unittest.mock import patch
 
+from human_emulator.social import SocialFetchResult
 from tools.registry import DomainOutcome, ToolContext, _record_domain_failure, _record_fetch_outcome, dispatch_tool
 
 
@@ -20,6 +22,40 @@ class _DummyWriter:
         self.saved_count += 1
         self.saved_rows.append({"url": url, "data": data})
         return "saved"
+
+
+class _FakeEmulatorBrowser:
+    async def get_context(self, platform: str):  # noqa: ARG002
+        return object()
+
+
+class _FakeEmulatorState:
+    def __init__(self) -> None:
+        self.platform_availability = {
+            "linkedin": {"status": "active", "reason": ""},
+            "x": {"status": "active", "reason": ""},
+        }
+        self.added_profiles: list[tuple[str, list[str]]] = []
+        self.visited: list[tuple[str, str]] = []
+
+    def availability(self, platform: str) -> dict[str, str]:
+        return self.platform_availability.get(platform, {"status": "unknown", "reason": ""})
+
+    def add_profiles(self, urls: list[str], platform: str = "linkedin") -> int:
+        self.added_profiles.append((platform, urls))
+        return len(urls)
+
+    def mark_visited(self, url: str, platform: str = "linkedin") -> None:
+        self.visited.append((platform, url))
+
+    def record_restriction(self, platform: str = "linkedin") -> int:  # noqa: ARG002
+        return 1
+
+    def set_pause_hours(self, platform: str, hours: int, reason: str = "") -> None:  # noqa: ARG002
+        self.platform_availability[platform] = {"status": "paused", "reason": reason}
+
+    def set_availability(self, platform: str, status: str, reason: str = "") -> None:
+        self.platform_availability[platform] = {"status": status, "reason": reason}
 
 
 class RegistryTests(unittest.IsolatedAsyncioTestCase):
@@ -111,6 +147,114 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("error", result)
         self.assertIn("not allowed in web mode", result["error"])
+
+    async def test_social_url_routes_through_matching_adapter(self) -> None:
+        writer = _DummyWriter()
+        state = _FakeEmulatorState()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "NA",
+                "min_leads": 1,
+                "social_platforms": ["linkedin"],
+            },
+            sheets_writer=writer,
+            source_mode="all",
+            emulator_browser=_FakeEmulatorBrowser(),
+            emulator_state=state,
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"linkedin.com"}
+        ctx.suggested_target_urls = {"https://www.linkedin.com/in/test-person"}
+
+        class _FakeLinkedInAdapter:
+            platform = "linkedin"
+
+            def __init__(self, context, state_arg, client_id: str):  # noqa: ARG002
+                self.context = context
+                self.state = state_arg
+
+            async def fetch(self, url: str) -> SocialFetchResult:
+                return SocialFetchResult(
+                    final_url=url,
+                    title="Alice Smith",
+                    page_kind="profile",
+                    html=(
+                        "<html><body><h1>Alice Smith</h1>"
+                        "<div class='headline'>CTO</div>"
+                        "<a class='social' href='https://www.linkedin.com/in/test-person'>profile</a>"
+                        "</body></html>"
+                    ),
+                    extracted_data={
+                        "name": "Alice Smith",
+                        "job_title": "CTO",
+                        "social_media": url,
+                    },
+                )
+
+        with patch("tools.registry.adapter_for_url", return_value=_FakeLinkedInAdapter):
+            result = await dispatch_tool(
+                "fetch_page",
+                {"url": "https://www.linkedin.com/in/test-person", "needs_javascript": True},
+                ctx,
+            )
+
+        self.assertEqual(result["page_kind"], "profile")
+        self.assertEqual(ctx.fetch_metadata[result["fetch_id"]]["platform"], "linkedin")
+        self.assertEqual(state.visited[0], ("linkedin", "https://www.linkedin.com/in/test-person"))
+
+    async def test_social_search_fetch_adds_profiles_to_platform_queue(self) -> None:
+        writer = _DummyWriter()
+        state = _FakeEmulatorState()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "NA",
+                "min_leads": 1,
+                "social_platforms": ["x"],
+            },
+            sheets_writer=writer,
+            source_mode="human_emulator",
+            emulator_browser=_FakeEmulatorBrowser(),
+            emulator_state=state,
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"x.com"}
+        ctx.suggested_target_urls = {"https://x.com/search?q=Founder&f=user"}
+
+        class _FakeXAdapter:
+            platform = "x"
+
+            def __init__(self, context, state_arg, client_id: str):  # noqa: ARG002
+                self.context = context
+                self.state = state_arg
+
+            async def fetch(self, url: str) -> SocialFetchResult:
+                return SocialFetchResult(
+                    final_url=url,
+                    title="X User Search",
+                    page_kind="search_results",
+                    html=(
+                        "<html><body>"
+                        "<a href='https://x.com/alice' data-hovercard-type='user'>Alice Smith</a>"
+                        "</body></html>"
+                    ),
+                    extracted_data={
+                        "results": [
+                            {"url": "https://x.com/alice", "name": "Alice Smith", "headline": "Founder"}
+                        ]
+                    },
+                )
+
+        with patch("tools.registry.adapter_for_url", return_value=_FakeXAdapter):
+            result = await dispatch_tool(
+                "fetch_page",
+                {"url": "https://x.com/search?q=Founder&f=user", "needs_javascript": True},
+                ctx,
+            )
+
+        self.assertEqual(result["page_kind"], "search_results")
+        self.assertEqual(state.added_profiles[0], ("x", ["https://x.com/alice"]))
 
     async def test_parse_html_rejects_search_pages(self) -> None:
         writer = _DummyWriter()

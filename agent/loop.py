@@ -225,7 +225,7 @@ def _build_follow_through_reminder(ctx: ToolContext) -> str:
     if _needs_target_suggestions(ctx):
         return (
             f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
-            "You are in broad web mode with website=NA. Call suggest_targets first to get the curated "
+            "You are in a website=NA run. Call suggest_targets first to get the curated "
             "starter target list before fetching pages."
         )
 
@@ -404,18 +404,18 @@ def _under_target_stop_reason(ctx: ToolContext, prefix: str) -> str:
 
 
 def _needs_target_suggestions(ctx: ToolContext) -> bool:
-    """Return True when broad web mode has not yet requested curated targets."""
+    """Return True when a website=NA run has not yet requested curated targets."""
     return (
-        ctx.source_mode == "web"
+        ctx.source_mode in {"web", "human_emulator", "all"}
         and str(ctx.client_config.get("website", "NA")).upper() == "NA"
         and not ctx.suggest_targets_called
     )
 
 
 def _needs_target_fetch_follow_through(ctx: ToolContext) -> bool:
-    """Return True when broad-mode curated targets were suggested but not yet fetched."""
+    """Return True when curated starter targets were suggested but not yet fetched."""
     if not (
-        ctx.source_mode == "web"
+        ctx.source_mode in {"web", "human_emulator", "all"}
         and str(ctx.client_config.get("website", "NA")).upper() == "NA"
         and ctx.suggest_targets_called
         and ctx.suggested_target_urls

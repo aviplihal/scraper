@@ -160,6 +160,26 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Call suggest_targets first", reminder)
 
+    def test_follow_through_reminder_requests_suggest_targets_in_human_emulator_mode(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find technical decision makers we can market to",
+                "job_title": "Founder",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 3,
+                "social_platforms": ["linkedin", "x"],
+            },
+            sheets_writer=writer,
+            source_mode="human_emulator",
+        )
+
+        reminder = _build_follow_through_reminder(ctx)
+
+        self.assertIn("Call suggest_targets first", reminder)
+
     def test_follow_through_reminder_requests_fetch_after_suggest_targets(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(

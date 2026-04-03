@@ -26,6 +26,7 @@ logging.basicConfig(
 )
 
 from agent.runner import run_job  # noqa: E402 — import after dotenv
+from human_emulator.platforms import supported_social_platforms  # noqa: E402
 
 
 def _validate_config(config: dict, client_arg: str) -> None:
@@ -42,6 +43,26 @@ def _validate_config(config: dict, client_arg: str) -> None:
             "client config must include a positive integer 'min_leads' "
             "so the job knows how many viable leads to target before stopping."
         )
+
+    social_platforms = config.get("social_platforms", [])
+    if social_platforms is None:
+        social_platforms = []
+    if not isinstance(social_platforms, list):
+        raise ValueError("client config 'social_platforms' must be a list of platform names if provided.")
+
+    supported = set(supported_social_platforms())
+    normalized = []
+    for platform in social_platforms:
+        if not isinstance(platform, str) or not platform.strip():
+            raise ValueError("client config 'social_platforms' must contain non-empty platform names.")
+        normalized_name = platform.strip().lower()
+        if normalized_name not in supported:
+            raise ValueError(
+                f"Unsupported social platform '{platform}'. Supported values are: {', '.join(sorted(supported))}."
+            )
+        normalized.append(normalized_name)
+    if normalized:
+        config["social_platforms"] = normalized
 
 
 def main() -> None:

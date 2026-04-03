@@ -5,6 +5,7 @@
   "area": "San Francisco Bay Area",
   "website": "NA",
   "min_leads": 3,
+  "social_platforms": ["linkedin", "x"],
   "sources": ["web", "human_emulator"],
   "fields": {
     "name": "Full name of the person",

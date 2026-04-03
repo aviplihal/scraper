@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from agent.loop import run_agent_loop
 from human_emulator.browser import EmulatorBrowser
+from human_emulator.platforms import adapter_for_platform
 from human_emulator.state import EmulatorState
 from storage.writer import StorageWriter
 # To switch back to Google Sheets, replace the line above with:
@@ -45,7 +46,7 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
     if source == "all":
         emulator_browser = EmulatorBrowser(client_id)
         await emulator_browser.start()
-        emulator_state = EmulatorState(client_id)
+        emulator_state = EmulatorState(client_id, _social_platforms_for_config(config))
 
     ctx = ToolContext(
         client_config    = config,
@@ -58,6 +59,8 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
     )
 
     try:
+        if source == "all":
+            await _preflight_social_platforms(config, ctx)
         run_result = await run_agent_loop(config, source, ctx)
     finally:
         await scraper.close()
@@ -70,9 +73,10 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
 async def _run_emulator(config: dict, writer: StorageWriter) -> None:
     """Run a human-emulator-only job: process queued social-media profiles."""
     client_id        = config["client_id"]
+    platforms        = _social_platforms_for_config(config)
     emulator_browser = EmulatorBrowser(client_id)
-    context          = await emulator_browser.start()
-    emulator_state   = EmulatorState(client_id)
+    await emulator_browser.start()
+    emulator_state   = EmulatorState(client_id, platforms)
 
     ctx = ToolContext(
         client_config    = config,
@@ -84,25 +88,18 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
     )
 
     try:
-        if emulator_state.queue_exhausted():
-            print("[runner] Human emulator queue is empty. Add profile URLs to the state file.")
-            print(f"         State file: state/{client_id}_state.json")
-            print("         Add URLs to the 'profiles_queue' array and re-run.")
+        if not platforms:
+            print("[runner] No social platforms are enabled for this client. Add 'social_platforms' to the config.")
+            run_result = _noop_run_result("No social platforms were enabled for this client.")
+            _print_run_summary(config, "human_emulator", writer, ctx, run_result)
             return
 
-        if emulator_state.daily_budget_exhausted():
-            print(f"[runner] Daily visit budget exhausted ({emulator_state.visits_today} visits today). "
-                  "Re-run tomorrow.")
+        await _preflight_social_platforms(config, ctx)
+        if not _has_active_social_platform(ctx, platforms):
+            print("[runner] No enabled social platforms are currently active. Check credentials or pause state.")
+            run_result = _noop_run_result("No enabled social platforms were active for this run.")
+            _print_run_summary(config, "human_emulator", writer, ctx, run_result)
             return
-
-        paused, until = emulator_state.is_paused()
-        if paused:
-            print(f"[runner] Emulator is paused until {until}. Re-run after that time.")
-            return
-
-        print(f"[runner] Human emulator queue: {len(emulator_state._data['profiles_queue'])} total, "
-              f"position {emulator_state._data['current_position']}, "
-              f"{emulator_state.visits_today}/{75} visited today.")
 
         # Run the agent loop — it will call fetch_page with social-media URLs
         # which are auto-routed to the human emulator via the tool dispatcher
@@ -141,6 +138,21 @@ def _print_run_summary(
     print(f"Target reached: {'yes' if target_reached else 'no'}")
     print(f"Failed URLs: {len(ctx.failed_urls)}")
     print(f"Why stop   : {run_result['stop_reason']}")
+
+    social_platforms = _social_platforms_for_config(config)
+    if social_platforms and ctx.emulator_state is not None:
+        print("\nSocial platforms:")
+        for platform in social_platforms:
+            snapshot = ctx.emulator_state.platform_summary(platform)
+            status = snapshot["status"]
+            reason = snapshot["reason"]
+            visits = snapshot["visits_today"]
+            line = f"  - {platform}: {status} ({visits} visited today)"
+            if reason:
+                line += f" — {reason}"
+            if snapshot["paused_until"]:
+                line += f" until {snapshot['paused_until']}"
+            print(line)
 
     if ctx._logged_sites_chosen:
         print("\nSites chosen:")
@@ -200,3 +212,50 @@ def _target_domain_for_config(config: dict) -> str | None:
     parsed = urlparse(website if "://" in website else f"https://{website}")
     host = parsed.netloc or parsed.path
     return host.lower().split(":", 1)[0].removeprefix("www.") or None
+
+
+def _social_platforms_for_config(config: dict) -> list[str]:
+    """Return normalized enabled social platforms for the client."""
+    return [
+        str(platform).strip().lower()
+        for platform in config.get("social_platforms", [])
+        if str(platform).strip()
+    ]
+
+
+async def _preflight_social_platforms(config: dict, ctx: ToolContext) -> None:
+    """Validate social sessions and create adapter instances for active platforms."""
+    if ctx.emulator_browser is None or ctx.emulator_state is None:
+        return
+
+    for platform in _social_platforms_for_config(config):
+        adapter_cls = adapter_for_platform(platform)
+        if adapter_cls is None:
+            ctx.emulator_state.set_availability(platform, "unavailable", "Unsupported social platform.")
+            continue
+
+        context = await ctx.emulator_browser.get_context(platform)
+        adapter = adapter_cls(context, ctx.emulator_state, config["client_id"])
+        status, reason = await adapter.preflight()
+        ctx.emulator_state.set_availability(platform, status, reason)
+        if status == "active":
+            ctx.social_adapters[platform] = adapter
+
+
+def _has_active_social_platform(ctx: ToolContext, platforms: list[str]) -> bool:
+    """Return True if at least one enabled social platform is active."""
+    if ctx.emulator_state is None:
+        return False
+    return any(
+        ctx.emulator_state.availability(platform)["status"] == "active"
+        for platform in platforms
+    )
+
+
+def _noop_run_result(stop_reason: str) -> dict[str, object]:
+    """Build a no-op run result for early exits that still want a summary."""
+    return {
+        "status": "done",
+        "steps_run": 0,
+        "stop_reason": stop_reason,
+    }

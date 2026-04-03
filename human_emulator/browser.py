@@ -1,17 +1,15 @@
 """Persistent browser profile manager for the human emulator.
 
-Creates a Playwright persistent context at profiles/{client_id}/ so that
-cookies, cached assets, login sessions, and browser history accumulate
-between runs exactly like a real user's browser.
-
-playwright-stealth patches every context to suppress headless fingerprints.
+Creates one persistent Playwright context per social platform so cookies,
+cached assets, login sessions, and browser history accumulate between runs
+like a real browser for that specific platform.
 """
 
 import logging
 import os
 from pathlib import Path
 
-from playwright.async_api import Browser, BrowserContext, Playwright, async_playwright
+from playwright.async_api import BrowserContext, Playwright, async_playwright
 from playwright_stealth import Stealth
 
 _stealth = Stealth()
@@ -36,20 +34,33 @@ _VIEWPORT = {"width": 1280, "height": 800}
 
 
 class EmulatorBrowser:
-    """Owns the Playwright instance and the persistent browser context."""
+    """Owns Playwright and per-platform persistent browser contexts."""
 
     def __init__(self, client_id: str):
         self.client_id = client_id
-        self._profile_dir = Path(f"profiles/{client_id}")
+        self._profile_root = Path("profiles/social")
         self._playwright: Playwright | None = None
-        self._context: BrowserContext | None = None
+        self._contexts: dict[str, BrowserContext] = {}
 
-    async def start(self) -> BrowserContext:
-        """Launch (or resume) the persistent browser context."""
-        self._profile_dir.mkdir(parents=True, exist_ok=True)
-        self._playwright = await async_playwright().start()
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self._profile_dir),
+    async def start(self) -> "EmulatorBrowser":
+        """Initialize Playwright. Contexts are launched lazily per platform."""
+        self._profile_root.mkdir(parents=True, exist_ok=True)
+        if self._playwright is None:
+            self._playwright = await async_playwright().start()
+        logger.info("Social emulator browser started for client '%s'", self.client_id)
+        return self
+
+    async def get_context(self, platform: str) -> BrowserContext:
+        """Launch or return the persistent context for a platform."""
+        if self._playwright is None:
+            await self.start()
+        if platform in self._contexts:
+            return self._contexts[platform]
+
+        profile_dir = self._profile_root / platform
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        context = await self._playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
             headless=True,
             args=[
                 "--no-sandbox",
@@ -62,25 +73,26 @@ class EmulatorBrowser:
             permissions=["geolocation"],
             locale="en-US",
         )
-        # Apply stealth to every new page that opens in this context
-        self._context.on("page", self._on_new_page)
-        logger.info("Persistent browser context started for client '%s'", self.client_id)
-        return self._context
+        context.on("page", self._on_new_page)
+        self._contexts[platform] = context
+        logger.info("Persistent browser context started for social platform '%s'", platform)
+        return context
 
     async def _on_new_page(self, page) -> None:  # noqa: ANN001
         await _stealth.apply_stealth_async(page)
 
-    async def new_page(self):
-        """Open a new page in the persistent context with stealth applied."""
-        if self._context is None:
-            raise RuntimeError("EmulatorBrowser not started — call start() first.")
-        page = await self._context.new_page()
+    async def new_page(self, platform: str):
+        """Open a new page in the platform's persistent context with stealth applied."""
+        context = await self.get_context(platform)
+        page = await context.new_page()
         await _stealth.apply_stealth_async(page)
         return page
 
     async def close(self) -> None:
-        if self._context:
-            await self._context.close()
+        for context in self._contexts.values():
+            await context.close()
+        self._contexts.clear()
         if self._playwright:
             await self._playwright.stop()
-        logger.info("Persistent browser context closed.")
+            self._playwright = None
+        logger.info("Persistent browser contexts closed.")

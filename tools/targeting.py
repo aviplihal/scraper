@@ -1,4 +1,4 @@
-"""Curated target selection helpers for broad-mode discovery."""
+"""Curated target selection helpers for web and social discovery."""
 
 from __future__ import annotations
 
@@ -35,6 +35,8 @@ _MARKETING_SALES_TERMS = (
     "demand gen",
     "business development",
 )
+
+_SUPPORTED_SOCIAL_PLATFORMS = ("linkedin", "x")
 
 
 def suggest_targets(client_config: dict, source_mode: str, limit: int = 8) -> dict:
@@ -83,13 +85,41 @@ def _infer_strategy(client_config: dict) -> str:
 def _targets_for_strategy(strategy: str, client_config: dict, source_mode: str) -> list[dict[str, object]]:
     area = str(client_config.get("area", "NA")).strip()
     requested_title = str(client_config.get("job_title", "")).strip()
+    search_terms = _strategy_terms(strategy, requested_title, client_config)
+
+    web_targets = _web_targets_for_strategy(strategy, search_terms, area)
+    social_targets = _social_targets_for_strategy(search_terms, area, _enabled_social_platforms(client_config))
+
+    if source_mode == "web":
+        return web_targets
+    if source_mode == "human_emulator":
+        return _interleave_target_groups(social_targets.values())
+
+    if source_mode == "all":
+        grouped: list[list[dict[str, object]]] = []
+        if web_targets:
+            grouped.append(web_targets)
+        grouped.extend(targets for targets in social_targets.values() if targets)
+        return _interleave_target_groups(grouped)
+
+    return web_targets
+
+
+def _strategy_terms(strategy: str, requested_title: str, client_config: dict) -> list[str]:
     if strategy == "leadership_people":
-        search_terms = _dedupe_terms(
-            [requested_title, "Founder", "CTO", "Head of Engineering"],
-        )
+        return _dedupe_terms([requested_title, "Founder", "CTO", "Head of Engineering"])
+    if strategy == "technical_profiles":
+        return _dedupe_terms([requested_title, "Senior Software Engineer", "Software Engineer", "Architect"])
+    if strategy == "marketing_sales_people":
+        return _dedupe_terms([requested_title, "Head of Growth", "VP Sales", "Marketing Director"])
+    return _dedupe_terms([requested_title, str(client_config.get("job", "")).strip()])
+
+
+def _web_targets_for_strategy(strategy: str, search_terms: list[str], area: str) -> list[dict[str, object]]:
+    if strategy == "leadership_people":
         targets = [
             _github_search_target(term, area, priority)
-            for priority, term in zip((100, 95, 90), search_terms[:3], strict=False)
+            for priority, term in zip((100, 94, 88), search_terms[:3], strict=False)
         ]
         targets.extend(
             [
@@ -97,42 +127,61 @@ def _targets_for_strategy(strategy: str, client_config: dict, source_mode: str) 
                     "url": "https://www.ycombinator.com/founders",
                     "kind": "people_directory",
                     "reason": "Public founder directory aligned to startup leadership personas.",
-                    "priority": 85,
+                    "priority": 82,
                 },
                 {
                     "url": "https://www.ycombinator.com/people",
                     "kind": "people_directory",
                     "reason": "Public people directory aligned to startup leadership personas.",
-                    "priority": 80,
+                    "priority": 76,
                 },
             ]
         )
         return targets
 
     if strategy == "technical_profiles":
-        search_terms = _dedupe_terms(
-            [requested_title, "Senior Software Engineer", "Software Engineer", "Architect"],
-        )
         return [
             _github_search_target(term, area, priority)
-            for priority, term in zip((100, 95, 90, 85), search_terms[:4], strict=False)
+            for priority, term in zip((100, 94, 88, 82), search_terms[:4], strict=False)
         ]
 
     if strategy == "marketing_sales_people":
-        search_terms = _dedupe_terms(
-            [requested_title, "Head of Growth", "VP Sales", "Marketing Director"],
-        )
         return [
             _github_search_target(term, area, priority)
-            for priority, term in zip((100, 95, 90), search_terms[:3], strict=False)
+            for priority, term in zip((100, 94, 88), search_terms[:3], strict=False)
         ]
 
-    search_terms = _dedupe_terms([requested_title, str(client_config.get("job", "")).strip()])
     return [
         _github_search_target(term, area, priority)
-        for priority, term in zip((100, 95), search_terms[:2], strict=False)
+        for priority, term in zip((100, 94), search_terms[:2], strict=False)
         if term
     ]
+
+
+def _social_targets_for_strategy(
+    search_terms: list[str],
+    area: str,
+    enabled_platforms: list[str],
+) -> dict[str, list[dict[str, object]]]:
+    targets: dict[str, list[dict[str, object]]] = {}
+    for platform in enabled_platforms:
+        platform_targets: list[dict[str, object]] = []
+        priorities = (98, 92, 86)
+        for priority, term in zip(priorities, search_terms[:3], strict=False):
+            target = _social_search_target(platform, term, area, priority)
+            if target:
+                platform_targets.append(target)
+        targets[platform] = platform_targets
+    return targets
+
+
+def _enabled_social_platforms(client_config: dict) -> list[str]:
+    configured = [
+        str(platform).strip().lower()
+        for platform in client_config.get("social_platforms", [])
+        if str(platform).strip()
+    ]
+    return [platform for platform in configured if platform in _SUPPORTED_SOCIAL_PLATFORMS]
 
 
 def _pinned_site_targets(website: str) -> list[dict[str, object]]:
@@ -170,6 +219,39 @@ def _github_search_target(term: str, area: str, priority: int) -> dict[str, obje
     }
 
 
+def _social_search_target(platform: str, term: str, area: str, priority: int) -> dict[str, object] | None:
+    query_parts = [term.strip()]
+    if area and area.upper() != "NA":
+        query_parts.append(area)
+    query = " ".join(part for part in query_parts if part).strip()
+    if platform == "linkedin":
+        return {
+            "url": f"https://www.linkedin.com/search/results/people/?keywords={quote_plus(query)}",
+            "kind": "search_results",
+            "reason": f"LinkedIn people search for '{query}'.",
+            "priority": priority,
+        }
+    if platform == "x":
+        return {
+            "url": f"https://x.com/search?q={quote_plus(query)}&f=user",
+            "kind": "search_results",
+            "reason": f"X user search for '{query}'.",
+            "priority": priority,
+        }
+    return None
+
+
+def _interleave_target_groups(groups: list[list[dict[str, object]]]) -> list[dict[str, object]]:
+    """Interleave target groups so one domain/platform does not dominate the run."""
+    ordered: list[dict[str, object]] = []
+    working = [list(group) for group in groups if group]
+    while any(working):
+        for group in working:
+            if group:
+                ordered.append(group.pop(0))
+    return ordered
+
+
 def _dedupe_terms(terms: list[str]) -> list[str]:
     seen: set[str] = set()
     deduped: list[str] = []
@@ -180,3 +262,4 @@ def _dedupe_terms(terms: list[str]) -> list[str]:
         seen.add(normalized)
         deduped.append(term.strip())
     return deduped
+

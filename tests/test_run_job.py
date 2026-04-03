@@ -29,6 +29,26 @@ class RunJobValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "min_leads"):
             _validate_config(config, "example_client")
 
+    def test_validate_config_accepts_supported_social_platforms(self) -> None:
+        config = {
+            "client_id": "example_client",
+            "min_leads": 1,
+            "social_platforms": ["linkedin", "x"],
+        }
+
+        _validate_config(config, "example_client")
+        self.assertEqual(config["social_platforms"], ["linkedin", "x"])
+
+    def test_validate_config_rejects_unknown_social_platform(self) -> None:
+        config = {
+            "client_id": "example_client",
+            "min_leads": 1,
+            "social_platforms": ["linkedin", "instagram"],
+        }
+
+        with self.assertRaisesRegex(ValueError, "Unsupported social platform"):
+            _validate_config(config, "example_client")
+
 
 if __name__ == "__main__":
     unittest.main()
