@@ -196,18 +196,59 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         ctx.suggest_targets_called = True
         ctx.suggested_targets = [
-            {"url": "https://github.com/search?q=Founder&type=users", "priority": 100},
-            {"url": "https://www.ycombinator.com/founders", "priority": 90},
+            {"url": "https://www.linkedin.com/search/results/people/?keywords=Founder", "domain": "linkedin.com"},
+            {"url": "https://github.com/search?q=Founder&type=users", "domain": "github.com"},
+            {"url": "https://x.com/search?q=Founder&f=user", "domain": "x.com"},
         ]
-        ctx.suggested_target_urls = {
-            "https://github.com/search?q=Founder&type=users",
-            "https://www.ycombinator.com/founders",
-        }
+        ctx.allowed_domains = {"linkedin.com", "github.com", "x.com"}
+        ctx.candidate_domains = ["linkedin.com", "github.com", "x.com"]
 
         reminder = _build_follow_through_reminder(ctx)
 
-        self.assertIn("Fetch 1 to 2 of the highest-priority suggested targets now", reminder)
-        self.assertIn("https://github.com/search?q=Founder&type=users", reminder)
+        self.assertIn("Choose 1 to 2 starter targets that best match the keyword brief", reminder)
+        self.assertIn("https://www.linkedin.com/search/results/people/?keywords=Founder", reminder)
+
+    def test_follow_through_reminder_nudges_domain_switch_when_current_domain_has_no_saves(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 3,
+            },
+            sheets_writer=writer,
+            source_mode="all",
+        )
+        ctx.suggest_targets_called = True
+        ctx.keyword_brief = {
+            "primary_terms": ["Senior Software Engineer"],
+            "secondary_terms": ["Software Engineer", "Architect"],
+            "area": "San Francisco Bay Area",
+            "source_mode": "all",
+        }
+        ctx.suggested_targets = [
+            {"url": "https://www.linkedin.com/search/results/people/?keywords=Senior+Software+Engineer", "domain": "linkedin.com"},
+            {"url": "https://x.com/search?q=Senior+Software+Engineer&f=user", "domain": "x.com"},
+            {"url": "https://github.com/search?q=Senior+Software+Engineer&type=users", "domain": "github.com"},
+        ]
+        ctx.allowed_domains = {"linkedin.com", "x.com", "github.com"}
+        ctx.candidate_domains = ["linkedin.com", "x.com", "github.com"]
+        ctx.domain_fetch_counts["github.com"] = 2
+        ctx.fetch_metadata["fetch-1"] = {
+            "url": "https://github.com/search?q=Senior+Software+Engineer&type=users",
+            "final_url": "https://github.com/search?q=Senior+Software+Engineer&type=users",
+            "title": "User search results · GitHub",
+            "page_kind": "search_results",
+            "preview": "results",
+        }
+        ctx.processed_fetch_ids.add("fetch-1")
+
+        reminder = _build_follow_through_reminder(ctx)
+
+        self.assertIn("Prefer a different domain/source now because github.com has not produced a viable lead yet", reminder)
 
     async def test_auto_fail_remaining_non_actionable_pages_marks_pages_processed(self) -> None:
         writer = _DummyWriter()

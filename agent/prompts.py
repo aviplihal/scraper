@@ -46,8 +46,8 @@ think briefly, call a tool, observe the result, think again.
 
 8. **When website is NA:** reason about which websites and enabled social platforms are most relevant for the given \
 job title, industry, and area. These describe the target people you want to market to, not jobs you want to fill. \
-Start from the curated target list returned by suggest_targets instead of inventing domains ad hoc. \
-Log each site you choose by calling it. In web-only runs, avoid choosing social-media sites.
+Read the keyword brief returned by suggest_targets, compare the candidate targets, and choose the next site that best matches the keywords. \
+Do not assume GitHub is first just because it is familiar. In web-only runs, avoid choosing social-media sites.
 
 9. **For social-media URLs** (LinkedIn and X in this version):
    Call fetch_page normally — the system will automatically route them to the \
@@ -88,7 +88,8 @@ For each URL you consider:
 - Do not brainstorm implementation ideas.
 - Do not keep retrying the same kind of irrelevant site.
 - When website is specified, stay on that website/domain.
-- In website=NA web mode, call suggest_targets first and stay within the curated target pool for the run.
+- In website=NA runs, call suggest_targets first and stay within the candidate domain pool for the run.
+- Use the keyword brief from suggest_targets to choose between web and enabled social targets in `all` mode.
 - After list_links, fetch and process only 1 to 2 candidate profile pages at a time before asking for more links.
 - If a page is clearly a job board listing page instead of a people directory, mark it failed and move on.
 - If a page is blocked by captcha or "Just a moment" protection, mark it failed and move on.
@@ -119,9 +120,9 @@ def build_user_prompt(config: dict, source: str) -> str:
         site_instruction = (
             "No target website was specified. Reason about which websites are most relevant "
             f"for finding '{job_title}' people leads for this marketing job. "
-            "If source=web, begin by calling suggest_targets and work from that curated starter list. "
-            "If source=human_emulator or source=all, also use suggest_targets for the enabled social platforms. "
-            "Stay within that curated target pool instead of inventing random domains. "
+            "Call suggest_targets first, read the keyword brief it returns, and choose the next site from the candidate targets. "
+            "If source=human_emulator or source=all, compare the enabled social platforms with the web candidates instead of defaulting to GitHub. "
+            "Stay within that candidate domain pool instead of inventing random domains. "
             "Prefer public non-social sites and company/team/leadership discovery pages that can lead to real people."
         )
     else:
@@ -139,7 +140,7 @@ def build_user_prompt(config: dict, source: str) -> str:
             "Use the human emulator source. Call suggest_targets first, then process only the enabled social-media platforms. "
             "Call fetch_page with social URLs and the system will route them correctly."
         ),
-        "all": "Use all available sources — web scraping and enabled social-media emulation from the curated target list.",
+        "all": "Use all available sources — web scraping and enabled social-media emulation chosen from the suggest_targets keyword brief.",
     }.get(source, "Use all available sources.")
 
     fields_block = "\n".join(f"  - {k}: {v}" for k, v in fields.items())

@@ -1,7 +1,7 @@
 """Tool registry: tool definitions plus the async dispatcher.
 
 Six tools are exposed to the agent:
-  1. suggest_targets — return ranked starter targets for the current run
+  1. suggest_targets — return a keyword brief plus candidate targets for the current run
   2. fetch_page      — fetch a URL and classify the page
   3. list_links      — extract candidate navigation/profile links from a page
   4. parse_html      — extract fields from previously fetched HTML via CSS selectors
@@ -116,7 +116,11 @@ class ToolContext:
     suggested_targets: list[dict[str, Any]] = field(default_factory=list)
     suggested_target_urls: set[str]    = field(default_factory=set)
     allowed_domains: set[str]          = field(default_factory=set)
+    candidate_domains: list[str]       = field(default_factory=list)
+    avoid_domains: list[str]           = field(default_factory=list)
     target_strategy: str | None        = None
+    keyword_brief: dict[str, Any]      = field(default_factory=dict)
+    source_mix: str | None             = None
     social_adapters: dict[str, Any]    = field(default_factory=dict)
 
 
@@ -130,9 +134,9 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "suggest_targets",
             "description": (
-                "Return ranked starter URLs for broad-mode discovery when website is NA. "
-                "Use this before your first fetch in web broad mode so you start from curated, "
-                "persona-relevant people discovery pages."
+                "Return a keyword brief plus candidate targets for broad-mode discovery when website is NA. "
+                "Use this before your first fetch so you can choose from allowed, persona-relevant domains "
+                "instead of inventing domains ad hoc."
             ),
             "parameters": {
                 "type": "object",
@@ -360,22 +364,38 @@ async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> di
 # ---------------------------------------------------------------------------
 
 def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
-    """Return ranked starter URLs for the current run and arm broad-mode gating."""
+    """Return a keyword brief and candidate targets for the current run."""
     result = suggest_targets(ctx.client_config, ctx.source_mode, limit=max(1, min(int(limit), 20)))
-    targets = result.get("targets", [])
+    targets = result.get("candidate_targets", [])
     ctx.suggest_targets_called = True
     ctx.suggested_targets = list(targets)
     ctx.target_strategy = str(result.get("strategy", "unknown"))
+    ctx.keyword_brief = dict(result.get("keyword_brief", {}))
+    ctx.source_mix = str(result.get("source_mix", "unknown"))
     ctx.suggested_target_urls = {
         _normalize_url(str(target["url"]))
         for target in targets
         if isinstance(target, dict) and target.get("url")
     }
-    ctx.allowed_domains = {
-        _domain_for_url(str(target["url"]))
-        for target in targets
-        if isinstance(target, dict) and target.get("url")
-    }
+    candidate_domains = [
+        str(domain).strip().lower()
+        for domain in result.get("allowed_domains", [])
+        if str(domain).strip()
+    ]
+    if not candidate_domains:
+        candidate_domains = [
+            _domain_for_url(str(target["url"]))
+            for target in targets
+            if isinstance(target, dict) and target.get("url")
+        ]
+    candidate_domains = list(dict.fromkeys(candidate_domains))
+    ctx.candidate_domains = candidate_domains
+    ctx.allowed_domains = set(candidate_domains)
+    ctx.avoid_domains = [
+        str(domain).strip().lower()
+        for domain in result.get("avoid_domains", [])
+        if str(domain).strip()
+    ]
     return result
 
 
@@ -694,7 +714,7 @@ def _same_or_subdomain(host: str, target_host: str) -> bool:
 
 
 def _uses_curated_target_pool(ctx: ToolContext) -> bool:
-    """Return True when website=NA runs should start from suggest_targets output."""
+    """Return True when website=NA runs should stay inside the keyword-driven candidate pool."""
     return (
         ctx.source_mode in {"web", "human_emulator", "all"}
         and str(ctx.client_config.get("website", "NA")).upper() == "NA"
@@ -709,20 +729,26 @@ def _broad_mode_rejection(url: str, normalized_url: str, domain: str, ctx: ToolC
 
     if not ctx.suggest_targets_called:
         return (
-            "Broad web mode requires curated starter targets. Call suggest_targets first before "
-            "fetching pages."
+            "Broad website=NA runs require a keyword-driven target brief. Call suggest_targets first "
+            "before fetching pages."
         )
 
     if domain in ctx.domain_outcomes and ctx.domain_outcomes[domain].banned_for_run:
         return (
             f"Domain '{domain}' has been banned for this run due to blocked or low-yield pages. "
-            "Use another suggested target."
+            "Choose another allowed domain from suggest_targets."
+        )
+
+    if domain in ctx.avoid_domains:
+        return (
+            f"Domain '{domain}' is on the avoid list for this run. "
+            "Choose another candidate domain from suggest_targets."
         )
 
     if domain not in ctx.allowed_domains:
         return (
-            f"URL domain '{domain}' is outside the curated target pool for this run. "
-            "Use suggest_targets output instead of inventing new domains."
+            f"URL domain '{domain}' is outside the candidate domain pool for this run. "
+            "Use the suggest_targets brief instead of inventing new domains."
         )
 
     denied_reason = _broad_mode_denied_url(url)
@@ -835,14 +861,21 @@ def _record_domain_save(url: str, ctx: ToolContext) -> None:
 
 
 def _curated_target_pool_exhausted(ctx: ToolContext) -> bool:
-    """Return True when all suggested starter targets have been consumed or banned."""
+    """Return True when all candidate domains have been tried or banned."""
     if not _uses_curated_target_pool(ctx) or not ctx.suggest_targets_called:
         return False
 
-    for normalized_url in ctx.suggested_target_urls:
-        domain = _domain_for_url(normalized_url)
+    candidate_domains = ctx.candidate_domains or sorted(ctx.allowed_domains)
+    if not candidate_domains:
+        return False
+
+    fetched_domains = {
+        _domain_for_url(str(metadata.get("final_url") or metadata.get("url") or ""))
+        for metadata in ctx.fetch_metadata.values()
+    }
+    for domain in candidate_domains:
         outcome = ctx.domain_outcomes.get(domain)
-        if normalized_url not in ctx.url_to_fetch_id and not (outcome and outcome.banned_for_run):
+        if domain not in fetched_domains and not (outcome and outcome.banned_for_run):
             return False
 
     return not any(fetch_id not in ctx.processed_fetch_ids for fetch_id in ctx.fetch_metadata)

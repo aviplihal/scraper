@@ -1,4 +1,4 @@
-"""Curated target selection helpers for web and social discovery."""
+"""Keyword-driven target selection helpers for web and social discovery."""
 
 from __future__ import annotations
 
@@ -37,34 +37,50 @@ _MARKETING_SALES_TERMS = (
 )
 
 _SUPPORTED_SOCIAL_PLATFORMS = ("linkedin", "x")
+_AVOID_DOMAINS = (
+    "crunchbase.com",
+    "wellfound.com",
+    "techcrunch.com",
+    "producthunt.com",
+)
 
 
 def suggest_targets(client_config: dict, source_mode: str, limit: int = 8) -> dict:
-    """Return ranked starter URLs for the current client persona."""
+    """Return a keyword brief plus domain-diverse candidate targets for the run."""
     website = str(client_config.get("website", "NA")).strip()
+    strategy = _infer_strategy(client_config)
+    keyword_brief = _build_keyword_brief(strategy, client_config, source_mode)
+
     if website and website.upper() != "NA":
-        targets = _pinned_site_targets(website)
+        candidate_targets = _dedupe_candidate_targets(
+            _pinned_site_targets(website),
+            limit,
+        )
+        allowed_domains = _ordered_domains(candidate_targets)
         return {
             "strategy": "pinned_site",
-            "targets": targets[:limit],
+            "keyword_brief": keyword_brief,
+            "source_mix": _source_mix_for_mode(source_mode),
+            "candidate_targets": candidate_targets,
+            "allowed_domains": allowed_domains,
+            "avoid_domains": list(_AVOID_DOMAINS),
+            "selection_notes": _selection_notes(source_mode, social_enabled=False),
         }
 
-    strategy = _infer_strategy(client_config)
-    targets = _targets_for_strategy(strategy, client_config, source_mode)
-    deduped: list[dict[str, object]] = []
-    seen_urls: set[str] = set()
-    for target in targets:
-        url = str(target["url"])
-        if url in seen_urls:
-            continue
-        deduped.append(target)
-        seen_urls.add(url)
-        if len(deduped) >= max(1, min(limit, 20)):
-            break
-
+    candidate_targets = _dedupe_candidate_targets(
+        _candidate_targets_for_strategy(strategy, keyword_brief, client_config, source_mode),
+        limit,
+    )
+    allowed_domains = _ordered_domains(candidate_targets)
+    social_enabled = bool(_enabled_social_platforms(client_config))
     return {
         "strategy": strategy,
-        "targets": deduped,
+        "keyword_brief": keyword_brief,
+        "source_mix": _source_mix_for_mode(source_mode),
+        "candidate_targets": candidate_targets,
+        "allowed_domains": allowed_domains,
+        "avoid_domains": list(_AVOID_DOMAINS),
+        "selection_notes": _selection_notes(source_mode, social_enabled=social_enabled),
     }
 
 
@@ -82,27 +98,48 @@ def _infer_strategy(client_config: dict) -> str:
     return "general_people"
 
 
-def _targets_for_strategy(strategy: str, client_config: dict, source_mode: str) -> list[dict[str, object]]:
-    area = str(client_config.get("area", "NA")).strip()
+def _build_keyword_brief(strategy: str, client_config: dict, source_mode: str) -> dict[str, object]:
     requested_title = str(client_config.get("job_title", "")).strip()
-    search_terms = _strategy_terms(strategy, requested_title, client_config)
+    requested_job = str(client_config.get("job", "")).strip()
+    strategy_terms = _strategy_terms(strategy, requested_title, client_config)
+    primary_terms = _dedupe_terms([requested_title or requested_job or strategy_terms[0]])
+    secondary_terms = [
+        term
+        for term in strategy_terms
+        if term.lower() not in {value.lower() for value in primary_terms}
+    ]
+    return {
+        "primary_terms": primary_terms[:2],
+        "secondary_terms": secondary_terms[:3],
+        "area": str(client_config.get("area", "NA")).strip() or "NA",
+        "source_mode": source_mode,
+    }
 
-    web_targets = _web_targets_for_strategy(strategy, search_terms, area)
-    social_targets = _social_targets_for_strategy(search_terms, area, _enabled_social_platforms(client_config))
+
+def _candidate_targets_for_strategy(
+    strategy: str,
+    keyword_brief: dict[str, object],
+    client_config: dict,
+    source_mode: str,
+) -> list[dict[str, object]]:
+    primary_terms = list(keyword_brief.get("primary_terms", []))
+    secondary_terms = list(keyword_brief.get("secondary_terms", []))
+    search_terms = _dedupe_terms([*primary_terms, *secondary_terms])
+    area = str(keyword_brief.get("area", "NA"))
+
+    web_groups = _web_target_groups(strategy, search_terms, area)
+    social_groups = _social_target_groups(search_terms, area, _enabled_social_platforms(client_config))
 
     if source_mode == "web":
-        return web_targets
+        return _interleave_target_groups(list(web_groups.values()))
     if source_mode == "human_emulator":
-        return _interleave_target_groups(social_targets.values())
-
+        return _interleave_target_groups(list(social_groups.values()))
     if source_mode == "all":
-        grouped: list[list[dict[str, object]]] = []
-        if web_targets:
-            grouped.append(web_targets)
-        grouped.extend(targets for targets in social_targets.values() if targets)
-        return _interleave_target_groups(grouped)
-
-    return web_targets
+        groups: list[list[dict[str, object]]] = []
+        groups.extend(group for group in social_groups.values() if group)
+        groups.extend(group for group in web_groups.values() if group)
+        return _interleave_target_groups(groups)
+    return _interleave_target_groups(list(web_groups.values()))
 
 
 def _strategy_terms(strategy: str, requested_title: str, client_config: dict) -> list[str]:
@@ -115,64 +152,49 @@ def _strategy_terms(strategy: str, requested_title: str, client_config: dict) ->
     return _dedupe_terms([requested_title, str(client_config.get("job", "")).strip()])
 
 
-def _web_targets_for_strategy(strategy: str, search_terms: list[str], area: str) -> list[dict[str, object]]:
+def _web_target_groups(strategy: str, search_terms: list[str], area: str) -> dict[str, list[dict[str, object]]]:
+    groups: dict[str, list[dict[str, object]]] = {}
     if strategy == "leadership_people":
-        targets = [
-            _github_search_target(term, area, priority)
-            for priority, term in zip((100, 94, 88), search_terms[:3], strict=False)
+        groups["ycombinator.com"] = [
+            _candidate_target(
+                "https://www.ycombinator.com/founders",
+                source="web",
+                family="people_directory",
+                reason="Public founder directory aligned to startup leadership personas.",
+            ),
+            _candidate_target(
+                "https://www.ycombinator.com/people",
+                source="web",
+                family="people_directory",
+                reason="Public people directory aligned to startup leadership personas.",
+            ),
         ]
-        targets.extend(
-            [
-                {
-                    "url": "https://www.ycombinator.com/founders",
-                    "kind": "people_directory",
-                    "reason": "Public founder directory aligned to startup leadership personas.",
-                    "priority": 82,
-                },
-                {
-                    "url": "https://www.ycombinator.com/people",
-                    "kind": "people_directory",
-                    "reason": "Public people directory aligned to startup leadership personas.",
-                    "priority": 76,
-                },
-            ]
-        )
-        return targets
+        groups["github.com"] = [_github_search_target(term, area) for term in search_terms[:3]]
+        return groups
 
-    if strategy == "technical_profiles":
-        return [
-            _github_search_target(term, area, priority)
-            for priority, term in zip((100, 94, 88, 82), search_terms[:4], strict=False)
-        ]
+    if strategy in {"technical_profiles", "marketing_sales_people", "general_people"}:
+        groups["github.com"] = [_github_search_target(term, area) for term in search_terms[:4]]
+        return groups
 
-    if strategy == "marketing_sales_people":
-        return [
-            _github_search_target(term, area, priority)
-            for priority, term in zip((100, 94, 88), search_terms[:3], strict=False)
-        ]
-
-    return [
-        _github_search_target(term, area, priority)
-        for priority, term in zip((100, 94), search_terms[:2], strict=False)
-        if term
-    ]
+    groups["github.com"] = [_github_search_target(term, area) for term in search_terms[:2]]
+    return groups
 
 
-def _social_targets_for_strategy(
+def _social_target_groups(
     search_terms: list[str],
     area: str,
     enabled_platforms: list[str],
 ) -> dict[str, list[dict[str, object]]]:
-    targets: dict[str, list[dict[str, object]]] = {}
+    groups: dict[str, list[dict[str, object]]] = {}
     for platform in enabled_platforms:
-        platform_targets: list[dict[str, object]] = []
-        priorities = (98, 92, 86)
-        for priority, term in zip(priorities, search_terms[:3], strict=False):
-            target = _social_search_target(platform, term, area, priority)
+        targets: list[dict[str, object]] = []
+        for term in search_terms[:3]:
+            target = _social_search_target(platform, term, area)
             if target:
-                platform_targets.append(target)
-        targets[platform] = platform_targets
-    return targets
+                targets.append(target)
+        if targets:
+            groups[targets[0]["domain"]] = targets
+    return groups
 
 
 def _enabled_social_platforms(client_config: dict) -> list[str]:
@@ -187,6 +209,8 @@ def _enabled_social_platforms(client_config: dict) -> list[str]:
 def _pinned_site_targets(website: str) -> list[dict[str, object]]:
     parsed = urlparse(website if "://" in website else f"https://{website}")
     base = f"{parsed.scheme or 'https'}://{parsed.netloc or parsed.path}".rstrip("/")
+    domain = _domain_for_url(base)
+    source = "social" if domain in {"linkedin.com", "x.com", "twitter.com"} else "web"
     paths = [
         "",
         "/people",
@@ -196,53 +220,88 @@ def _pinned_site_targets(website: str) -> list[dict[str, object]]:
         "/staff",
     ]
     return [
-        {
-            "url": urljoin(base + "/", path.lstrip("/")),
-            "kind": "company_page" if path else "fallback",
-            "reason": "Pinned site starter page.",
-            "priority": 100 - idx,
-        }
-        for idx, path in enumerate(paths)
+        _candidate_target(
+            urljoin(base + "/", path.lstrip("/")),
+            source=source,
+            family="pinned_site",
+            reason="Pinned site starter page.",
+        )
+        for path in paths
     ]
 
 
-def _github_search_target(term: str, area: str, priority: int) -> dict[str, object]:
+def _github_search_target(term: str, area: str) -> dict[str, object]:
     query_parts = [term.strip()]
     if area and area.upper() != "NA":
         query_parts.append(f'location:"{area}"')
     query = " ".join(part for part in query_parts if part).strip()
-    return {
-        "url": f"https://github.com/search?q={quote_plus(query)}&type=users",
-        "kind": "search_results",
-        "reason": f"Public GitHub user search for '{query}'.",
-        "priority": priority,
-    }
+    return _candidate_target(
+        f"https://github.com/search?q={quote_plus(query)}&type=users",
+        source="web",
+        family="developer_profiles",
+        reason=f"Public GitHub user search matching '{query}'.",
+    )
 
 
-def _social_search_target(platform: str, term: str, area: str, priority: int) -> dict[str, object] | None:
+def _social_search_target(platform: str, term: str, area: str) -> dict[str, object] | None:
     query_parts = [term.strip()]
     if area and area.upper() != "NA":
         query_parts.append(area)
     query = " ".join(part for part in query_parts if part).strip()
     if platform == "linkedin":
-        return {
-            "url": f"https://www.linkedin.com/search/results/people/?keywords={quote_plus(query)}",
-            "kind": "search_results",
-            "reason": f"LinkedIn people search for '{query}'.",
-            "priority": priority,
-        }
+        return _candidate_target(
+            f"https://www.linkedin.com/search/results/people/?keywords={quote_plus(query)}",
+            source="social",
+            family="people_search",
+            reason=f"Enabled social people search matching '{query}'.",
+        )
     if platform == "x":
-        return {
-            "url": f"https://x.com/search?q={quote_plus(query)}&f=user",
-            "kind": "search_results",
-            "reason": f"X user search for '{query}'.",
-            "priority": priority,
-        }
+        return _candidate_target(
+            f"https://x.com/search?q={quote_plus(query)}&f=user",
+            source="social",
+            family="people_search",
+            reason=f"Enabled social user search matching '{query}'.",
+        )
     return None
 
 
+def _candidate_target(url: str, source: str, family: str, reason: str) -> dict[str, object]:
+    return {
+        "url": url,
+        "source": source,
+        "family": family,
+        "domain": _domain_for_url(url),
+        "reason": reason,
+    }
+
+
+def _source_mix_for_mode(source_mode: str) -> str:
+    if source_mode == "all":
+        return "model_decides"
+    if source_mode == "human_emulator":
+        return "social_only"
+    if source_mode == "web":
+        return "web_only"
+    return source_mode
+
+
+def _selection_notes(source_mode: str, social_enabled: bool) -> list[str]:
+    notes = [
+        "Choose the next site that best matches the keyword brief.",
+        "Do not assume GitHub is first.",
+        "Prefer a new domain/source if the previous one produced no viable leads.",
+    ]
+    if source_mode == "web":
+        notes.append("Stay within non-social web domains for this run.")
+    if source_mode == "human_emulator":
+        notes.append("Use only the enabled social platforms in this run.")
+    if source_mode == "all" and social_enabled:
+        notes.append("Compare social people search with web profile search before choosing the next site.")
+    return notes
+
+
 def _interleave_target_groups(groups: list[list[dict[str, object]]]) -> list[dict[str, object]]:
-    """Interleave target groups so one domain/platform does not dominate the run."""
+    """Interleave per-domain groups so the first wave stays domain-diverse."""
     ordered: list[dict[str, object]] = []
     working = [list(group) for group in groups if group]
     while any(working):
@@ -250,6 +309,37 @@ def _interleave_target_groups(groups: list[list[dict[str, object]]]) -> list[dic
             if group:
                 ordered.append(group.pop(0))
     return ordered
+
+
+def _dedupe_candidate_targets(targets: list[dict[str, object]], limit: int) -> list[dict[str, object]]:
+    deduped: list[dict[str, object]] = []
+    seen_urls: set[str] = set()
+    for target in targets:
+        url = str(target.get("url", "")).strip()
+        if not url or url in seen_urls:
+            continue
+        deduped.append(target)
+        seen_urls.add(url)
+        if len(deduped) >= max(1, min(limit, 20)):
+            break
+    return deduped
+
+
+def _ordered_domains(targets: list[dict[str, object]]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for target in targets:
+        domain = str(target.get("domain", "")).strip().lower()
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        ordered.append(domain)
+    return ordered
+
+
+def _domain_for_url(url: str) -> str:
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    return parsed.netloc.lower().split(":", 1)[0].removeprefix("www.")
 
 
 def _dedupe_terms(terms: list[str]) -> list[str]:
@@ -262,4 +352,3 @@ def _dedupe_terms(terms: list[str]) -> list[str]:
         seen.add(normalized)
         deduped.append(term.strip())
     return deduped
-

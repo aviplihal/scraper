@@ -29,6 +29,11 @@ class _FakeEmulatorBrowser:
         return object()
 
 
+class _FakeScraperBrowser:
+    def new_context(self):
+        return object()
+
+
 class _FakeEmulatorState:
     def __init__(self) -> None:
         self.platform_availability = {
@@ -77,10 +82,12 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         result = await dispatch_tool("suggest_targets", {"limit": 4}, ctx)
 
         self.assertEqual(result["strategy"], "leadership_people")
-        urls = [target["url"] for target in result["targets"]]
+        urls = [target["url"] for target in result["candidate_targets"]]
         self.assertIn("https://www.ycombinator.com/founders", urls)
         self.assertNotIn("https://www.crunchbase.com/people", urls)
         self.assertTrue(ctx.suggest_targets_called)
+        self.assertEqual(ctx.keyword_brief["primary_terms"], ["Founder"])
+        self.assertIn("ycombinator.com", ctx.allowed_domains)
 
     async def test_broad_mode_rejects_fetch_before_suggest_targets(self) -> None:
         writer = _DummyWriter()
@@ -99,7 +106,7 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         result = await dispatch_tool(
             "fetch_page",
-            {"url": "https://www.crunchbase.com/people", "needs_javascript": True},
+            {"url": "https://example.com/people", "needs_javascript": True},
             ctx,
         )
 
@@ -124,12 +131,44 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         await dispatch_tool("suggest_targets", {"limit": 4}, ctx)
         result = await dispatch_tool(
             "fetch_page",
-            {"url": "https://www.crunchbase.com/people", "needs_javascript": True},
+            {"url": "https://example.com/people", "needs_javascript": True},
             ctx,
         )
 
         self.assertIn("error", result)
-        self.assertIn("outside the curated target pool", result["error"])
+        self.assertIn("outside the candidate domain pool", result["error"])
+
+    async def test_broad_mode_allows_model_selected_url_within_allowed_domain_pool(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 1,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+            scraper_browser=_FakeScraperBrowser(),
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"github.com"}
+        ctx.candidate_domains = ["github.com"]
+
+        class _FakeFetchResult:
+            final_url = "https://github.com/alice-smith"
+            html = "<html><head><title>Alice Smith</title></head><body><h1>Alice Smith</h1></body></html>"
+
+        with patch("tools.registry.smart_fetch", return_value=_FakeFetchResult()):
+            result = await dispatch_tool(
+                "fetch_page",
+                {"url": "https://github.com/alice-smith", "needs_javascript": False},
+                ctx,
+            )
+
+        self.assertEqual(result["page_kind"], "profile")
 
     async def test_web_mode_rejects_social_media_urls(self) -> None:
         writer = _DummyWriter()

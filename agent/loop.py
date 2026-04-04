@@ -13,7 +13,13 @@ import logging
 import ollama
 
 from agent.prompts import SYSTEM_PROMPT, build_user_prompt
-from tools.registry import TOOL_DEFINITIONS, ToolContext, _curated_target_pool_exhausted, dispatch_tool
+from tools.registry import (
+    TOOL_DEFINITIONS,
+    ToolContext,
+    _curated_target_pool_exhausted,
+    _domain_for_url,
+    dispatch_tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +162,8 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
             result_str = json.dumps(result, ensure_ascii=False)
 
             print(f"[step {step}] ← {result_str[:300]}", flush=True)
+            if tool_name == "suggest_targets" and "error" not in result:
+                _print_targeting_brief(result)
 
             messages.append({"role": "tool", "content": result_str})
 
@@ -225,54 +233,62 @@ def _build_follow_through_reminder(ctx: ToolContext) -> str:
     if _needs_target_suggestions(ctx):
         return (
             f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
-            "You are in a website=NA run. Call suggest_targets first to get the curated "
-            "starter target list before fetching pages."
+            "You are in a website=NA run. Call suggest_targets first to get the keyword brief "
+            "and candidate domains before fetching pages."
+        )
+
+    if _unprocessed_fetch_ids(ctx):
+        instructions: list[str] = []
+        for fetch_id in _unprocessed_fetch_ids(ctx)[:3]:
+            metadata = ctx.fetch_metadata.get(fetch_id, {})
+            page_kind = metadata.get("page_kind", "unknown")
+            url = metadata.get("final_url") or metadata.get("url") or "unknown URL"
+
+            if page_kind in {"search_results", "directory", "company_directory", "company_page"}:
+                action = (
+                    f"{fetch_id} ({page_kind}) {url}: call list_links on this page to discover candidate profile/detail URLs."
+                )
+            elif page_kind == "profile":
+                action = (
+                    f"{fetch_id} ({page_kind}) {url}: call parse_html on this detail/profile page, then save_result if the name is real."
+                )
+            else:
+                action = (
+                    f"{fetch_id} ({page_kind}) {url}: call fail_url if it is blocked, irrelevant, not found, or listing-only."
+                )
+            instructions.append(action)
+
+        summary = " ".join(instructions)
+        return (
+            f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
+            "You have fetched pages that are still unprocessed. "
+            "Use list_links on search_results/directory pages, parse_html on profile pages, "
+            "and fail_url on blocked, irrelevant, listing-only, or not-found pages. "
+            f"Outstanding pages: {summary}"
         )
 
     if _needs_target_fetch_follow_through(ctx):
-        pending_targets = []
-        for target in ctx.suggested_targets[:3]:
-            url = str(target.get("url", ""))
-            normalized = url.strip()
-            if normalized and normalized not in ctx.visited_urls:
-                pending_targets.append(url)
-        preview = " ".join(pending_targets[:3])
+        preview = " ".join(_candidate_preview_urls(ctx, limit=3))
+        keyword_brief = ctx.keyword_brief or {}
+        primary_terms = ", ".join(keyword_brief.get("primary_terms", [])) or "the target persona"
+        domain_switch_note = ""
+        switch_domain = _switch_candidate_domain(ctx)
+        if switch_domain:
+            domain_switch_note = (
+                f" Prefer a different domain/source now because {switch_domain} has not produced "
+                "a viable lead yet."
+            )
         return (
             f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
-            "You already called suggest_targets, but you have not fetched enough curated starter targets yet. "
-            "Fetch 1 to 2 of the highest-priority suggested targets now and continue from their results. "
-            f"Suggested starter URLs: {preview}"
+            f"You already called suggest_targets. Choose 1 to 2 starter targets that best match the keyword brief for {primary_terms}. "
+            f"Suggested starter URLs: {preview}.{domain_switch_note}"
         )
 
-    instructions: list[str] = []
-    for fetch_id in _unprocessed_fetch_ids(ctx)[:3]:
-        metadata = ctx.fetch_metadata.get(fetch_id, {})
-        page_kind = metadata.get("page_kind", "unknown")
-        url = metadata.get("final_url") or metadata.get("url") or "unknown URL"
-
-        if page_kind in {"search_results", "directory", "company_directory", "company_page"}:
-            action = (
-                f"{fetch_id} ({page_kind}) {url}: call list_links on this page to discover candidate profile/detail URLs."
-            )
-        elif page_kind == "profile":
-            action = (
-                f"{fetch_id} ({page_kind}) {url}: call parse_html on this detail/profile page, then save_result if the name is real."
-            )
-        else:
-            action = (
-                f"{fetch_id} ({page_kind}) {url}: call fail_url if it is blocked, irrelevant, not found, or listing-only."
-            )
-        instructions.append(action)
-
-    summary = " ".join(instructions)
     return (
         f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
-        "You have fetched pages that are still unprocessed. "
-        "Use list_links on search_results/directory pages, parse_html on profile pages, "
-        "and fail_url on blocked, irrelevant, listing-only, or not-found pages. "
-        f"Outstanding pages: {summary}"
+        "Continue with the candidate domains from suggest_targets until you reach the lead target "
+        "or no useful work remains."
     )
-
 
 async def _try_automatic_profile_processing(ctx: ToolContext, messages: list[dict], step: int) -> bool:
     """Process outstanding profile pages directly when the model fails to continue."""
@@ -394,7 +410,7 @@ def _under_target_stop_reason(ctx: ToolContext, prefix: str) -> str:
     """Build a consistent incomplete stop reason when the target is unmet."""
     if _curated_target_pool_exhausted(ctx):
         return (
-            "Curated target pool exhausted before reaching the lead target "
+            "Keyword-driven candidate pool exhausted before reaching the lead target "
             f"({_saved_lead_count(ctx)}/{_lead_target(ctx)} viable new leads saved)."
         )
     return (
@@ -413,18 +429,110 @@ def _needs_target_suggestions(ctx: ToolContext) -> bool:
 
 
 def _needs_target_fetch_follow_through(ctx: ToolContext) -> bool:
-    """Return True when curated starter targets were suggested but not yet fetched."""
+    """Return True when candidate domains remain unexplored and the target is still unmet."""
     if not (
         ctx.source_mode in {"web", "human_emulator", "all"}
         and str(ctx.client_config.get("website", "NA")).upper() == "NA"
         and ctx.suggest_targets_called
-        and ctx.suggested_target_urls
+        and (ctx.candidate_domains or ctx.allowed_domains)
     ):
         return False
 
-    visited = ctx.visited_urls
-    fetched_targets = sum(1 for url in ctx.suggested_target_urls if url in visited)
-    if fetched_targets >= min(2, len(ctx.suggested_target_urls)):
+    if _lead_target_reached(ctx):
         return False
 
-    return not _lead_target_reached(ctx)
+    return bool(_remaining_candidate_domains(ctx))
+
+
+def _print_targeting_brief(result: dict) -> None:
+    """Print a concise targeting brief after suggest_targets runs."""
+    strategy = str(result.get("strategy", "")).strip()
+    if strategy:
+        print(f"[agent] Target strategy: {strategy}", flush=True)
+
+    keyword_brief = result.get("keyword_brief", {})
+    if isinstance(keyword_brief, dict):
+        primary = ", ".join(keyword_brief.get("primary_terms", [])) or "n/a"
+        secondary = ", ".join(keyword_brief.get("secondary_terms", [])) or "n/a"
+        area = keyword_brief.get("area", "NA")
+        source_mode = keyword_brief.get("source_mode", "unknown")
+        print(
+            f"[agent] Keyword brief: primary={primary}; secondary={secondary}; area={area}; source_mode={source_mode}",
+            flush=True,
+        )
+
+    candidate_domains = result.get("allowed_domains", [])
+    if isinstance(candidate_domains, list) and candidate_domains:
+        print(
+            f"[agent] Candidate domains: {', '.join(str(domain) for domain in candidate_domains)}",
+            flush=True,
+        )
+
+
+def _fetched_candidate_domains(ctx: ToolContext) -> set[str]:
+    """Return candidate domains that have already been fetched in this run."""
+    fetched_domains = {
+        _domain_for_url(str(metadata.get("final_url") or metadata.get("url") or ""))
+        for metadata in ctx.fetch_metadata.values()
+    }
+    return {domain for domain in fetched_domains if domain in ctx.allowed_domains}
+
+
+def _remaining_candidate_domains(ctx: ToolContext) -> list[str]:
+    """Return allowed candidate domains that remain unfetched and unbanned."""
+    remaining: list[str] = []
+    fetched_domains = _fetched_candidate_domains(ctx)
+    for domain in ctx.candidate_domains or sorted(ctx.allowed_domains):
+        outcome = ctx.domain_outcomes.get(domain)
+        if outcome and outcome.banned_for_run:
+            continue
+        if domain not in fetched_domains:
+            remaining.append(domain)
+    return remaining
+
+
+def _candidate_preview_urls(ctx: ToolContext, limit: int = 3) -> list[str]:
+    """Return a few suggested starter URLs, preferring domains not fetched yet."""
+    preview_urls: list[str] = []
+    remaining_domains = set(_remaining_candidate_domains(ctx))
+    prioritized_targets = list(ctx.suggested_targets)
+    if remaining_domains:
+        prioritized_targets.sort(
+            key=lambda target: (
+                str(target.get("domain", "")) not in remaining_domains,
+                str(target.get("domain", "")),
+            )
+        )
+
+    for target in prioritized_targets:
+        url = str(target.get("url", "")).strip()
+        if not url or url in preview_urls:
+            continue
+        preview_urls.append(url)
+        if len(preview_urls) >= limit:
+            break
+    return preview_urls
+
+
+def _switch_candidate_domain(ctx: ToolContext) -> str | None:
+    """Return a domain to move away from when it has not produced viable leads yet."""
+    remaining_domains = _remaining_candidate_domains(ctx)
+    if not remaining_domains:
+        return None
+
+    if not ctx.fetch_metadata:
+        return None
+
+    last_metadata = next(reversed(ctx.fetch_metadata.values()))
+    last_domain = _domain_for_url(str(last_metadata.get("final_url") or last_metadata.get("url") or ""))
+    if last_domain not in ctx.allowed_domains:
+        return None
+
+    outcome = ctx.domain_outcomes.get(last_domain)
+    if outcome and outcome.saved_hits > 0:
+        return None
+
+    if ctx.domain_fetch_counts.get(last_domain, 0) < 1:
+        return None
+
+    return last_domain
