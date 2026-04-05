@@ -22,7 +22,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from human_emulator.platforms import adapter_for_url
-from human_emulator.social import RestrictionDetected
+from human_emulator.social import RestrictionDetected, build_profile_html
 from source_state import SourceState, domain_for_platform, infer_source_family, infer_source_identity, source_key
 from tools.discovery import build_preview, classify_page, extract_links
 from tools.fetcher import smart_fetch
@@ -154,6 +154,7 @@ class ToolContext:
     source_run_stats: dict[str, SourceRunStats] = field(default_factory=dict)
     discovery_source_samples: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     current_run_saved_leads: list[dict[str, Any]] = field(default_factory=list)
+    social_profile_hints: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -361,18 +362,27 @@ async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> di
     if tool_name == "suggest_targets":
         return _tool_suggest_targets(arguments.get("limit", 8), ctx)
     if tool_name == "fetch_page":
-        return await _tool_fetch_page(arguments["url"], arguments["needs_javascript"], ctx)
+        url, needs_javascript = _coerce_fetch_page_args(arguments, ctx)
+        if not url:
+            return {"error": "fetch_page requires a URL.", "arguments": arguments}
+        return await _tool_fetch_page(url, needs_javascript, ctx)
     elif tool_name == "list_links":
+        fetch_id = _coerce_fetch_id(arguments, ctx)
+        if not fetch_id:
+            return {"error": "list_links requires a valid fetch_id or URL for a previously fetched page.", "arguments": arguments}
         return _tool_list_links(
-            arguments["fetch_id"],
+            fetch_id,
             arguments.get("selector"),
             arguments.get("limit", 25),
             arguments.get("same_domain_only", False),
             ctx,
         )
     elif tool_name == "parse_html":
+        fetch_id = _coerce_fetch_id(arguments, ctx)
+        if not fetch_id:
+            return {"error": "parse_html requires a valid fetch_id or URL for a previously fetched page.", "arguments": arguments}
         return _tool_parse_html(
-            arguments["fetch_id"],
+            fetch_id,
             arguments.get("field_names"),
             arguments.get("fields", {}),
             ctx,
@@ -608,6 +618,7 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
         "page_kind": fetch_result.page_kind,
         "preview": preview,
         "platform": platform,
+        "extracted_data": fetch_result.extracted_data,
     }
     ctx.fetch_metadata[fetch_id] = metadata
     ctx.url_to_fetch_id[_normalize_url(url)] = fetch_id
@@ -629,7 +640,24 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
             ]
             if profile_urls:
                 ctx.emulator_state.add_profiles(profile_urls, platform=platform)
+            for item in fetch_result.extracted_data.get("results", []):
+                if not isinstance(item, dict) or not item.get("url"):
+                    continue
+                ctx.social_profile_hints[_normalize_url(str(item["url"]))] = {
+                    "name": item.get("name"),
+                    "job_title": item.get("headline"),
+                    "company": item.get("company"),
+                    "social_media": item.get("url"),
+                }
         else:
+            hint = ctx.social_profile_hints.get(_normalize_url(fetch_result.final_url or url), {})
+            if isinstance(fetch_result.extracted_data, dict) and hint:
+                for field_name, field_value in hint.items():
+                    if field_name not in fetch_result.extracted_data or not _has_meaningful_value(fetch_result.extracted_data.get(field_name)):
+                        fetch_result.extracted_data[field_name] = field_value
+                metadata["extracted_data"] = fetch_result.extracted_data
+                fetch_result.html = build_profile_html(fetch_result.extracted_data)
+                ctx.page_cache[fetch_id] = fetch_result.html
             preview = json.dumps(fetch_result.extracted_data, indent=2)
             metadata["preview"] = preview
             ctx.fetch_metadata[fetch_id]["preview"] = preview
@@ -1336,6 +1364,62 @@ def _coerce_save_result_args(arguments: dict[str, Any], ctx: ToolContext) -> tup
     return "", {}
 
 
+def _coerce_fetch_page_args(arguments: dict[str, Any], ctx: ToolContext) -> tuple[str, bool]:
+    """Normalize fetch_page arguments from strict or loose tool-call shapes."""
+    if not isinstance(arguments, dict):
+        return "", True
+
+    url = arguments.get("url")
+    fetch_id = arguments.get("fetch_id")
+    if not isinstance(url, str) or not url.strip():
+        if isinstance(fetch_id, str):
+            metadata = ctx.fetch_metadata.get(fetch_id, {})
+            inferred_url = metadata.get("final_url") or metadata.get("url") or ""
+            if inferred_url:
+                url = inferred_url
+        if not isinstance(url, str) or not url.strip():
+            return "", True
+
+    needs_javascript = arguments.get("needs_javascript")
+    if isinstance(needs_javascript, str):
+        lowered = needs_javascript.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            needs_javascript = True
+        elif lowered in {"false", "0", "no"}:
+            needs_javascript = False
+        else:
+            needs_javascript = None
+
+    if not isinstance(needs_javascript, bool):
+        domain = _domain_for_url(url)
+        needs_javascript = domain in {
+            "linkedin.com",
+            "x.com",
+            "twitter.com",
+            "github.com",
+            "gitlab.com",
+            "ycombinator.com",
+        }
+
+    return str(url).strip(), bool(needs_javascript)
+
+
+def _coerce_fetch_id(arguments: dict[str, Any], ctx: ToolContext) -> str:
+    """Infer a valid fetch_id from tool arguments."""
+    if not isinstance(arguments, dict):
+        return ""
+
+    fetch_id = arguments.get("fetch_id")
+    if isinstance(fetch_id, str) and fetch_id in ctx.fetch_metadata:
+        return fetch_id
+
+    url = arguments.get("url")
+    if isinstance(url, str) and url.strip():
+        return ctx.url_to_fetch_id.get(_normalize_url(url), "")
+
+    return ""
+
+
 def _coerce_fail_url(arguments: dict[str, Any], ctx: ToolContext) -> str:
     """Normalize fail_url arguments from strict or loose Ollama tool-call shapes."""
     if not isinstance(arguments, dict):
@@ -1393,11 +1477,48 @@ def _postprocess_extracted_fields(
             result["job_title"] = derived_title
 
     if domain in {"linkedin.com", "x.com", "twitter.com"}:
-        if "social_media" in requested_fields and not result.get("social_media"):
+        extracted_data = metadata.get("extracted_data", {})
+        if not isinstance(extracted_data, dict):
+            extracted_data = {}
+        hint_data = ctx.social_profile_hints.get(_normalize_url(final_url), {})
+        fallback_social: dict[str, Any] = {}
+        for field_name in {"name", "job_title", "company", "email", "phone", "website", "social_media", "headline"}:
+            extracted_value = extracted_data.get(field_name)
+            if field_name == "name" and isinstance(extracted_value, str) and extracted_value.strip().lower() == "unknown":
+                extracted_value = None
+            if field_name == "social_media" and isinstance(extracted_value, str) and extracted_value.strip().lower() in {"profile", "social", ""}:
+                extracted_value = None
+            fallback_social[field_name] = extracted_value if _has_meaningful_value(extracted_value) else hint_data.get(field_name)
+
+        if "social_media" in requested_fields and (
+            not result.get("social_media")
+            or str(result.get("social_media")).strip().lower() in {"profile", "social", ""}
+        ):
             result["social_media"] = final_url
 
-        if "name" in requested_fields and not result.get("name"):
-            result["name"] = _social_handle_from_url(final_url)
+        if "name" in requested_fields and (
+            not result.get("name")
+            or str(result.get("name")).strip().lower() == "unknown"
+        ):
+            result["name"] = (
+                fallback_social.get("name")
+                or _social_handle_from_url(final_url)
+            )
+
+        if "job_title" in requested_fields and not result.get("job_title"):
+            result["job_title"] = fallback_social.get("job_title") or fallback_social.get("headline")
+
+        if "company" in requested_fields and not result.get("company"):
+            result["company"] = fallback_social.get("company")
+
+        if "email" in requested_fields and not result.get("email"):
+            result["email"] = fallback_social.get("email")
+
+        if "phone" in requested_fields and not result.get("phone"):
+            result["phone"] = fallback_social.get("phone")
+
+        if "website" in requested_fields and not result.get("website"):
+            result["website"] = fallback_social.get("website")
 
     return result
 

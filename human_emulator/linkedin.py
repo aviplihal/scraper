@@ -39,12 +39,25 @@ _FEED_INDICATORS = [
     "input[placeholder*='Search']",
 ]
 
-_PROFILE_NAME_SELECTORS = ["h1.text-heading-xlarge", "h1"]
-_PROFILE_TITLE_SELECTORS = [".text-body-medium.break-words", ".pv-text-details__left-panel div.text-body-medium"]
+_PROFILE_NAME_SELECTORS = [
+    "h1.text-heading-xlarge",
+    "h1.inline.t-24.v-align-middle.break-words",
+    "main h1",
+    "section h1",
+    "h1",
+]
+_PROFILE_TITLE_SELECTORS = [
+    "div.text-body-medium.break-words",
+    "div.text-body-medium",
+    ".pv-text-details__left-panel div.text-body-medium",
+    "main .text-body-medium.break-words",
+]
 _PROFILE_COMPANY_SELECTORS = [
     "div.pv-text-details__right-panel .t-14",
     ".pv-top-card--experience-list-item .t-14",
     "span[aria-label*='Current company']",
+    "button[aria-label*='Current company']",
+    "a[href*='/company/'] span[aria-hidden='true']",
 ]
 _CONTACT_INFO_BTN = "a[href*='overlay/contact-info']"
 _MODAL_EMAIL_SEL = "section.ci-email a, a[href^='mailto:']"
@@ -161,6 +174,14 @@ class LinkedInAdapter(SocialAdapter):
         try:
             logger.info("Visiting LinkedIn profile: %s", url)
             await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+            try:
+                await page.wait_for_selector("main, h1", timeout=10_000)
+            except Exception:
+                pass
             await wait_reading_time(page)
             await _check_restriction(page)
 

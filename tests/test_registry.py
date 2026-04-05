@@ -204,6 +204,58 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("error", result)
         self.assertIn("not allowed in web mode", result["error"])
 
+    async def test_fetch_page_defaults_needs_javascript_when_model_omits_it(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "https://github.com",
+                "min_leads": 1,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+            scraper_browser=_FakeScraperBrowser(),
+        )
+
+        class _FakeFetchResult:
+            final_url = "https://github.com/alice-smith"
+            html = "<html><body><h1>Alice Smith</h1></body></html>"
+
+        with patch("tools.registry.smart_fetch", return_value=_FakeFetchResult()):
+            result = await dispatch_tool(
+                "fetch_page",
+                {"url": "https://github.com/alice-smith"},
+                ctx,
+            )
+
+        self.assertEqual(result["page_kind"], "profile")
+
+    async def test_list_links_can_resolve_fetch_id_from_url(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "https://github.com", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.page_cache["fetch-lookup"] = "<html><body><a href='https://github.com/alice'>Alice</a></body></html>"
+        ctx.fetch_metadata["fetch-lookup"] = {
+            "url": "https://github.com/search?q=test&type=users",
+            "final_url": "https://github.com/search?q=test&type=users",
+            "title": "User search results · GitHub",
+            "page_kind": "search_results",
+            "preview": "results",
+        }
+        ctx.url_to_fetch_id["https://github.com/search?q=test&type=users"] = "fetch-lookup"
+
+        result = await dispatch_tool(
+            "list_links",
+            {"url": "https://github.com/search?q=test&type=users", "limit": 5},
+            ctx,
+        )
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["links"][0]["url"], "https://github.com/alice")
+
     async def test_social_url_routes_through_matching_adapter(self) -> None:
         writer = _DummyWriter()
         state = _FakeEmulatorState()
@@ -431,6 +483,58 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
                 "name": "Big-Silver",
                 "job_title": "As a full stack developer, I have over than 11 years of web development background.",
                 "social_media": "https://github.com/Big-Silver",
+            },
+        )
+
+    async def test_parse_html_social_uses_search_hints_when_profile_fields_are_blank(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "NA",
+                "min_leads": 1,
+                "fields": {
+                    "name": "Full name",
+                    "job_title": "Title",
+                    "social_media": "Profile URL",
+                },
+            },
+            sheets_writer=writer,
+            source_mode="all",
+        )
+        profile_url = "https://www.linkedin.com/in/abhiraj-gupta-86711516b/"
+        ctx.page_cache["fetch-social-1"] = (
+            "<html><body><h1>Unknown</h1>"
+            "<a class='social' href='https://www.linkedin.com/in/abhiraj-gupta-86711516b/'>profile</a>"
+            "</body></html>"
+        )
+        ctx.fetch_metadata["fetch-social-1"] = {
+            "url": profile_url,
+            "final_url": profile_url,
+            "title": "LinkedIn profile",
+            "page_kind": "profile",
+            "preview": "profile",
+            "platform": "linkedin",
+            "extracted_data": {"name": "Unknown", "job_title": None, "social_media": profile_url},
+        }
+        ctx.social_profile_hints[profile_url] = {
+            "name": "Abhiraj Gupta",
+            "job_title": "Senior Software Engineer",
+            "social_media": profile_url,
+        }
+
+        result = await dispatch_tool(
+            "parse_html",
+            {"fetch_id": "fetch-social-1", "field_names": ["name", "job_title", "social_media"]},
+            ctx,
+        )
+
+        self.assertEqual(
+            result["fields"],
+            {
+                "name": "Abhiraj Gupta",
+                "job_title": "Senior Software Engineer",
+                "social_media": profile_url,
             },
         )
 
