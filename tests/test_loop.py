@@ -128,6 +128,49 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writer.saved_count, 1)
         self.assertEqual(writer.saved_rows[0]["source_url"], "https://github.com/alice-smith")
 
+    async def test_automatic_profile_processing_scales_batch_to_remaining_gap(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "https://github.com",
+                "min_leads": 3,
+                "fields": {
+                    "name": "Full name",
+                    "job_title": "Title",
+                    "social_media": "Profile URL",
+                },
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        for fetch_id, slug, title in [
+            ("fetch-1", "alice-smith", "CTO"),
+            ("fetch-2", "bob-jones", "Founder"),
+            ("fetch-3", "carla-chen", "Senior Software Engineer"),
+        ]:
+            ctx.page_cache[fetch_id] = f"""
+            <html>
+              <head><title>{slug} ({title}) · GitHub</title></head>
+              <body>
+                <span itemprop="name">{slug.replace('-', ' ').title()}</span>
+                <div class="p-note">{title}</div>
+              </body>
+            </html>
+            """
+            ctx.fetch_metadata[fetch_id] = {
+                "url": f"https://github.com/{slug}",
+                "final_url": f"https://github.com/{slug}",
+                "title": f"{slug} ({title}) · GitHub",
+                "page_kind": "profile",
+                "preview": slug,
+            }
+
+        processed = await _try_automatic_profile_processing(ctx, [], step=5)
+
+        self.assertTrue(processed)
+        self.assertEqual(writer.saved_count, 3)
+
     def test_follow_through_reminder_includes_target_progress(self) -> None:
         writer = _DummyWriter()
         writer.saved_count = 2

@@ -107,6 +107,7 @@ class DiscoveryTests(unittest.TestCase):
           <body>
             <a href="/team">Team</a>
             <a href="/topics">Topics</a>
+            <a href="/accelerator">Accelerator</a>
             <a href="/alice-smith">Alice Smith</a>
             <a href="/bob-jones">Bob Jones</a>
           </body>

@@ -10,6 +10,7 @@ from source_state import SourceState
 from tools.registry import (
     DomainOutcome,
     ToolContext,
+    _normalize_lead_payload,
     _normalize_url,
     _record_domain_failure,
     _record_fetch_outcome,
@@ -25,13 +26,17 @@ class _DummyWriter:
         self._saved_urls: set[str] = set()
 
     async def append_row(self, url: str, data: dict, scrape_status: str = "ok") -> str:  # noqa: ARG002
-        if url in self._saved_urls:
+        normalized_url = _normalize_url(url)
+        if normalized_url in self._saved_urls:
             self.duplicate_count += 1
             return "duplicate"
-        self._saved_urls.add(url)
+        self._saved_urls.add(normalized_url)
         self.saved_count += 1
         self.saved_rows.append({"url": url, "data": data})
         return "saved"
+
+    def has_source_url(self, url: str) -> bool:
+        return _normalize_url(url) in self._saved_urls
 
     def recent_rows(self, limit: int = 20) -> list[dict]:
         return [
@@ -387,6 +392,89 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("error", result)
         self.assertIn("exhausted", result["error"])
+
+    async def test_fetch_page_skips_known_duplicate_source_url(self) -> None:
+        writer = _DummyWriter()
+        await writer.append_row(
+            "https://github.com/alice-smith",
+            {"name": "Alice Smith", "job_title": "Engineer"},
+        )
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+            scraper_browser=_FakeScraperBrowser(),
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"github.com"}
+        ctx.candidate_domains = ["github.com"]
+
+        result = await dispatch_tool(
+            "fetch_page",
+            {"url": "https://github.com/alice-smith", "needs_javascript": False},
+            ctx,
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("already exists in storage", result["error"])
+
+    async def test_list_links_skips_urls_already_in_storage(self) -> None:
+        writer = _DummyWriter()
+        await writer.append_row(
+            "https://github.com/alice-smith",
+            {"name": "Alice Smith", "job_title": "Engineer"},
+        )
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "https://github.com", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.page_cache["fetch-1"] = """
+        <html><body>
+          <a href="https://github.com/alice-smith">Alice</a>
+          <a href="https://github.com/bob-jones">Bob</a>
+        </body></html>
+        """
+        ctx.fetch_metadata["fetch-1"] = {
+            "url": "https://github.com/search?q=test&type=users",
+            "final_url": "https://github.com/search?q=test&type=users",
+            "title": "User search results · GitHub",
+            "page_kind": "search_results",
+            "preview": "results",
+        }
+
+        result = await dispatch_tool("list_links", {"fetch_id": "fetch-1", "limit": 5}, ctx)
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["links"][0]["url"], "https://github.com/bob-jones")
+
+    def test_normalize_lead_payload_splits_title_and_company(self) -> None:
+        normalized = _normalize_lead_payload(
+            "https://github.com/dabrad26",
+            {
+                "name": "David Bradshaw",
+                "job_title": "Senior Software Engineer at@adobe",
+                "company": "@adobe",
+                "social_media": "https://davidbradshaw.us/",
+            },
+        )
+
+        self.assertEqual(normalized["job_title"], "Senior Software Engineer")
+        self.assertEqual(normalized["company"], "Adobe")
+
+    def test_normalize_lead_payload_humanizes_handle_style_company(self) -> None:
+        normalized = _normalize_lead_payload(
+            "https://github.com/elliedori",
+            {
+                "name": "Ellie Bahadori",
+                "job_title": "Senior software engineer@VantaInc",
+                "company": None,
+                "social_media": "https://bsky.app/profile/elliedori.bsky.social",
+            },
+        )
+
+        self.assertEqual(normalized["job_title"], "Senior software engineer")
+        self.assertEqual(normalized["company"], "Vanta Inc")
 
     def test_social_profile_urls_canonicalize_mini_profile_variants(self) -> None:
         self.assertEqual(

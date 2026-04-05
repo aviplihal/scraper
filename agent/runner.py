@@ -46,9 +46,11 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
     emulator_browser = None
     emulator_state   = None
     if source == "all":
-        emulator_browser = EmulatorBrowser(client_id)
-        await emulator_browser.start()
-        emulator_state = EmulatorState(client_id, _social_platforms_for_config(config))
+        platforms = _social_platforms_for_config(config)
+        emulator_state = EmulatorState(client_id, platforms)
+        if _should_start_social_browser(emulator_state, platforms):
+            emulator_browser = EmulatorBrowser(client_id)
+            await emulator_browser.start()
 
     source_state = SourceState(client_id, config)
 
@@ -104,9 +106,11 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
     """Run a human-emulator-only job: process queued social-media profiles."""
     client_id        = config["client_id"]
     platforms        = _social_platforms_for_config(config)
-    emulator_browser = EmulatorBrowser(client_id)
-    await emulator_browser.start()
     emulator_state   = EmulatorState(client_id, platforms)
+    emulator_browser = None
+    if _should_start_social_browser(emulator_state, platforms):
+        emulator_browser = EmulatorBrowser(client_id)
+        await emulator_browser.start()
 
     source_state = SourceState(client_id, config)
 
@@ -150,7 +154,8 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
         }
     finally:
         try:
-            await emulator_browser.close()
+            if emulator_browser:
+                await emulator_browser.close()
         except Exception as exc:  # pragma: no cover - defensive cleanup
             logger.warning("Error while closing emulator browser: %s", exc)
 
@@ -301,7 +306,7 @@ def _social_platforms_for_config(config: dict) -> list[str]:
 
 async def _preflight_social_platforms(config: dict, ctx: ToolContext) -> None:
     """Validate social sessions and create adapter instances for active platforms."""
-    if ctx.emulator_browser is None or ctx.emulator_state is None:
+    if ctx.emulator_state is None:
         return
 
     ctx.active_social_platforms.clear()
@@ -309,9 +314,23 @@ async def _preflight_social_platforms(config: dict, ctx: ToolContext) -> None:
     ctx.unavailable_domains.clear()
 
     for platform in _social_platforms_for_config(config):
+        paused, until = ctx.emulator_state.is_paused(platform)
+        if paused:
+            reason = f"Paused until {until.isoformat()}." if until else "Paused."
+            ctx.emulator_state.set_availability(platform, "paused", reason)
+            ctx.unavailable_social_platforms.add(platform)
+            ctx.unavailable_domains.add(domain_for_platform(platform))
+            continue
+
         adapter_cls = adapter_for_platform(platform)
         if adapter_cls is None:
             ctx.emulator_state.set_availability(platform, "unavailable", "Unsupported social platform.")
+            ctx.unavailable_social_platforms.add(platform)
+            ctx.unavailable_domains.add(domain_for_platform(platform))
+            continue
+
+        if ctx.emulator_browser is None:
+            ctx.emulator_state.set_availability(platform, "unavailable", "Social browser was not started for this run.")
             ctx.unavailable_social_platforms.add(platform)
             ctx.unavailable_domains.add(domain_for_platform(platform))
             continue
@@ -339,6 +358,11 @@ def _has_active_social_platform(ctx: ToolContext, platforms: list[str]) -> bool:
         ctx.emulator_state.availability(platform)["status"] == "active"
         for platform in platforms
     )
+
+
+def _should_start_social_browser(emulator_state: EmulatorState, platforms: list[str]) -> bool:
+    """Return True when at least one social platform is not already paused."""
+    return any(not emulator_state.is_paused(platform)[0] for platform in platforms)
 
 
 def _noop_run_result(stop_reason: str) -> dict[str, object]:

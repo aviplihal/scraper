@@ -609,7 +609,9 @@ async def _try_automatic_profile_processing(ctx: ToolContext, messages: list[dic
 
     processed_any = False
 
-    batch = profile_fetch_ids[:_AUTO_PROFILE_BATCH_SIZE]
+    remaining_gap = max(1, _lead_target(ctx) - _saved_lead_count(ctx))
+    batch_size = min(len(profile_fetch_ids), max(_AUTO_PROFILE_BATCH_SIZE, min(4, remaining_gap)))
+    batch = profile_fetch_ids[:batch_size]
     parse_records = await asyncio.gather(
         *[_auto_process_profile_fetch(step, fetch_id, ctx) for fetch_id in batch]
     )

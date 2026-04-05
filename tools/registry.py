@@ -517,6 +517,13 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
     normalized_url = _normalize_url(url)
     domain = _domain_for_url(url)
 
+    if _already_saved_source_url(url, ctx):
+        _mark_terminal_url(url, "duplicate", ctx)
+        return {
+            "error": "URL already exists in storage for this client. Skip it and continue with a new candidate.",
+            "url": url,
+        }
+
     if normalized_url in ctx.exhausted_discovery_urls:
         ctx.fetch_error_count += 1
         return {
@@ -828,6 +835,10 @@ def _tool_list_links(
             continue
         if candidate_url in seen_urls:
             continue
+        if _already_saved_source_url(candidate_url, ctx):
+            seen_urls.add(candidate_url)
+            _mark_terminal_url(candidate_url, "duplicate", ctx)
+            continue
         if candidate_url in ctx.visited_urls or candidate_url in ctx.terminal_url_outcomes:
             seen_urls.add(candidate_url)
             continue
@@ -1107,6 +1118,8 @@ def _filter_candidate_targets(targets: list[dict[str, Any]], ctx: ToolContext) -
             continue
         if _normalize_url(url) in ctx.exhausted_discovery_urls:
             continue
+        if _already_saved_source_url(url, ctx):
+            continue
         if _terminal_outcome_for_url(url, ctx):
             continue
         filtered.append(target)
@@ -1124,6 +1137,18 @@ def _ordered_target_domains(targets: list[dict[str, Any]]) -> list[str]:
         seen.add(domain)
         ordered.append(domain)
     return ordered
+
+
+def _already_saved_source_url(url: str, ctx: ToolContext) -> bool:
+    """Return True when the source URL is already present in persistent storage."""
+    writer = getattr(ctx, "sheets_writer", None)
+    has_source_url = getattr(writer, "has_source_url", None)
+    if callable(has_source_url):
+        try:
+            return bool(has_source_url(url))
+        except Exception:
+            return False
+    return False
 
 
 def _remove_domain_from_candidate_pool(domain: str, ctx: ToolContext) -> None:
@@ -1660,8 +1685,19 @@ def _normalize_lead_payload(source_url: str, data: dict[str, Any]) -> dict[str, 
             cleaned = _clean_field_text(value)
             normalized[key] = cleaned if cleaned else None
 
+    raw_job_title = normalized.get("job_title")
     normalized["job_title"] = _normalize_job_title_value(normalized.get("job_title"))
     normalized["company"] = _normalize_company_value(normalized.get("company"))
+    if not _has_meaningful_value(normalized.get("company")):
+        hinted_company = _derive_company_from_job_title_hint(raw_job_title)
+        if _has_meaningful_value(hinted_company):
+            normalized["company"] = hinted_company
+    derived_title, derived_company = _split_title_company(
+        normalized.get("job_title"),
+        normalized.get("company"),
+    )
+    normalized["job_title"] = derived_title
+    normalized["company"] = derived_company
     normalized["social_media"] = _normalize_social_value(normalized.get("social_media"), source_url)
     normalized["website"] = _normalize_website_value(
         normalized.get("website"),
@@ -1695,6 +1731,8 @@ def _normalize_job_title_value(value: Any) -> Any:
     if " {" in text and _looks_like_title_fragment(text.split(" {", 1)[0].strip()):
         text = text.split(" {", 1)[0].strip()
 
+    text = re.sub(r"\s+at\s*$", "", text, flags=re.IGNORECASE).strip()
+
     return text or None
 
 
@@ -1716,6 +1754,41 @@ def _normalize_company_value(value: Any) -> Any:
             return tokens[-1]
 
     return text
+
+
+def _split_title_company(job_title: Any, company: Any) -> tuple[Any, Any]:
+    """Extract trailing company text from a title when it is explicitly present."""
+    if not isinstance(job_title, str):
+        return job_title, company
+    title = job_title.strip()
+    if not title:
+        return None, company
+
+    match = re.match(r"^(?P<title>.+?)\s+at\s+(?P<company>.+)$", title, flags=re.IGNORECASE)
+    if not match:
+        return title, company
+
+    clean_title = match.group("title").strip()
+    explicit_company = _normalize_company_value(match.group("company").strip())
+    resolved_company = explicit_company or company
+    return clean_title or title, resolved_company
+
+
+def _derive_company_from_job_title_hint(job_title: Any) -> Any:
+    """Recover simple handle-style company text embedded in a job-title string."""
+    if not isinstance(job_title, str):
+        return None
+    text = _clean_field_text(job_title)
+    if not text or text.count("@") != 1:
+        return None
+
+    title_hint, company_hint = [part.strip() for part in text.split("@", 1)]
+    if not title_hint or not company_hint:
+        return None
+    title_hint = re.sub(r"\s+at\s*$", "", title_hint, flags=re.IGNORECASE).strip()
+    if not _looks_like_title_fragment(title_hint):
+        return None
+    return _normalize_company_value(f"@{company_hint}")
 
 
 def _normalize_social_value(value: Any, source_url: str) -> Any:
@@ -1783,9 +1856,12 @@ def _humanize_org_token(value: str) -> str:
     token = value.strip().strip("@")
     if not token:
         return token
+    token = re.sub(r"([a-z])([A-Z])", r"\1 \2", token)
     token = token.replace("_", " ").replace("-", " ")
-    if token.islower():
+    if token.islower() or token.istitle():
         return token.title()
+    if token.isupper() and len(token) <= 5:
+        return token
     return token
 
 

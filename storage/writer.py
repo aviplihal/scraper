@@ -19,6 +19,7 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +51,19 @@ class StorageWriter:
         self.saved_count = 0
         self.duplicate_count = 0
         self.saved_rows: list[dict] = []
+        self._known_source_urls: set[str] = set()
         self._init_db()
 
     def _init_db(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(_CREATE_TABLE)
+            rows = conn.execute("SELECT source_url FROM leads").fetchall()
             conn.commit()
+        self._known_source_urls = {
+            _normalize_source_url(str(row[0]))
+            for row in rows
+            if row and row[0]
+        }
         logger.info("Storage ready: %s", self.db_path)
 
     async def append_row(
@@ -96,6 +104,7 @@ class StorageWriter:
                 return "duplicate"
 
             self.saved_count += 1
+            self._known_source_urls.add(_normalize_source_url(source_url))
             self.saved_rows.append(
                 {
                     "name": data.get("name"),
@@ -123,3 +132,21 @@ class StorageWriter:
                 (max(1, int(limit)),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def has_source_url(self, source_url: str) -> bool:
+        """Return True when a source URL already exists in storage."""
+        return _normalize_source_url(source_url) in self._known_source_urls
+
+
+def _normalize_source_url(source_url: str) -> str:
+    """Normalize source URLs for duplicate checks."""
+    parsed = urlparse(source_url if "://" in source_url else f"https://{source_url}")
+    host = parsed.netloc.lower().split(":", 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    query = urlencode(parse_qsl(parsed.query, keep_blank_values=True), doseq=True)
+    normalized = parsed._replace(netloc=host, path=path, query=query, fragment="")
+    return urlunparse(normalized)

@@ -59,6 +59,27 @@ class StorageWriterTests(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_has_source_url_uses_normalized_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = StorageWriter("client_a")
+                lead = {
+                    "name": "Alice Smith",
+                    "job_title": "Senior Software Engineer",
+                    "company": "Example Co",
+                    "email": None,
+                    "phone": None,
+                    "social_media": None,
+                }
+
+                asyncio.run(writer.append_row("https://www.example.com/alice/", lead))
+
+                self.assertTrue(writer.has_source_url("https://example.com/alice"))
+            finally:
+                os.chdir(old_cwd)
+
 
 if __name__ == "__main__":
     unittest.main()
