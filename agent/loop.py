@@ -35,7 +35,9 @@ _MESSAGE_COMPACT_THRESHOLD = 12
 _MESSAGE_COMPACT_HARD_THRESHOLD = 22
 _COMPACTION_MIN_NEW_MESSAGES = 10
 _AUTO_PROFILE_BATCH_SIZE = 3
-_FAKE_TOOL_CALL_PATTERN = re.compile(r"\b(fetch_page|fetch_url|list_links|parse_html|save_result|fail_url|suggest_targets)\s*\(")
+_FAKE_TOOL_CALL_PATTERN = re.compile(
+    r"\b(fetch_page|fetch_url|list_links|parse_html|save_result|fail_url|suggest_targets|search|finish_run|finish_job)\s*\("
+)
 _RECOVERABLE_MODEL_ERROR_PATTERNS = (
     "xml syntax error",
     "closed by </parameter>",
@@ -197,6 +199,15 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
         if reached_target_this_step:
             break
 
+        if _no_viable_next_actions(ctx):
+            print(f"\n[agent] Agent finished after step {step} — no viable next actions remained.")
+            run_result["status"] = "completed"
+            run_result["stop_reason"] = _under_target_stop_reason(
+                ctx,
+                "No actionable pages or fetchable candidate targets remained",
+            )
+            break
+
         if await _try_automatic_profile_processing(ctx, messages, step):
             if _lead_target_reached(ctx):
                 print(
@@ -339,6 +350,10 @@ def _normalized_tool_name(tool_name: str) -> str:
     """Normalize model-emitted tool names to the supported registry names."""
     if tool_name == "fetch_url":
         return "fetch_page"
+    if tool_name == "finish_job":
+        return "finish_run"
+    if tool_name == "search":
+        return "suggest_targets"
     return tool_name
 
 

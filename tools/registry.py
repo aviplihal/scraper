@@ -20,7 +20,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 from human_emulator.platforms import adapter_for_url
 from human_emulator.social import RestrictionDetected, build_profile_html
@@ -452,20 +452,35 @@ def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
         len(ctx.low_yield_platforms),
         len(ctx.exhausted_discovery_urls),
         tuple(sorted(ctx.unavailable_domains)),
+        tuple(sorted(domain for domain, outcome in ctx.domain_outcomes.items() if outcome.banned_for_run)),
     )
     if (
         ctx.suggest_targets_called
         and ctx.last_suggest_targets_signature == signature
         and ctx.suggested_targets
     ):
+        filtered_targets = _filter_candidate_targets(ctx.suggested_targets, ctx)
+        filtered_domains = _ordered_target_domains(filtered_targets)
+        ctx.suggested_targets = list(filtered_targets)
+        ctx.suggested_target_urls = {
+            _normalize_url(str(target["url"]))
+            for target in filtered_targets
+            if isinstance(target, dict) and target.get("url")
+        }
+        ctx.candidate_domains = list(filtered_domains)
+        ctx.allowed_domains = set(filtered_domains)
         return {
             "status": "unchanged",
             "phase": ctx.source_phase,
             "strategy": ctx.target_strategy or "unknown",
             "keyword_brief": dict(ctx.keyword_brief),
-            "allowed_domains": list(ctx.candidate_domains or sorted(ctx.allowed_domains)),
-            "candidate_targets": list(ctx.suggested_targets[:1]),
-            "message": "Target brief unchanged in the current source phase. Continue the current viable seed or remaining candidate domains.",
+            "allowed_domains": list(filtered_domains),
+            "candidate_targets": list(filtered_targets[:1]),
+            "message": (
+                "Target brief unchanged in the current source phase. Continue the current viable seed or remaining candidate domains."
+                if filtered_targets
+                else "No viable starter targets remain in the current phase."
+            ),
         }
 
     result = suggest_targets(
@@ -919,6 +934,13 @@ async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
     if prior_outcome == "rejected":
         return {"status": "rejected", "url": url, "reason": "Previously rejected earlier in this run."}
 
+    if _already_saved_source_url(url, ctx):
+        duplicate_count = getattr(ctx.sheets_writer, "duplicate_count", None)
+        if isinstance(duplicate_count, int):
+            ctx.sheets_writer.duplicate_count = duplicate_count + 1
+        _mark_terminal_url(url, "duplicate", ctx)
+        return {"status": "duplicate", "url": url}
+
     data = _normalize_lead_payload(url, data)
     source_stats = _source_stats_for_url(url, ctx)
     viable, reason = _is_minimally_viable_lead(data, url)
@@ -1188,6 +1210,8 @@ def _filter_candidate_targets(targets: list[dict[str, Any]], ctx: ToolContext) -
         domain = str(target.get("domain", "")).strip().lower() or _domain_for_url(url)
         if not url or not domain:
             continue
+        if not _duckduckgo_profile_query_allowed(url, ctx):
+            continue
         if _url_budget_exhausted(url, ctx):
             continue
         if domain in ctx.unavailable_domains:
@@ -1195,6 +1219,12 @@ def _filter_candidate_targets(targets: list[dict[str, Any]], ctx: ToolContext) -
         outcome = ctx.domain_outcomes.get(domain)
         if outcome and outcome.banned_for_run:
             continue
+        if domain == "duckduckgo.com":
+            site_domain = _duckduckgo_target_site_domain(url)
+            if site_domain:
+                site_outcome = ctx.domain_outcomes.get(site_domain)
+                if site_domain in ctx.unavailable_domains or (site_outcome and site_outcome.banned_for_run):
+                    continue
         if domain == "linkedin.com" and "linkedin" in ctx.low_yield_platforms:
             continue
         if domain in {"x.com", "twitter.com"} and "x" in ctx.low_yield_platforms:
@@ -1232,6 +1262,51 @@ def _already_saved_source_url(url: str, ctx: ToolContext) -> bool:
         except Exception:
             return False
     return False
+
+
+def _duckduckgo_query(url: str) -> str:
+    """Return the normalized DuckDuckGo query string for a URL."""
+    if _domain_for_url(url) != "duckduckgo.com":
+        return ""
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    query_values = parse_qs(parsed.query).get("q", [])
+    if not query_values:
+        return ""
+    return " ".join(str(value).strip() for value in query_values if str(value).strip()).lower()
+
+
+def _duckduckgo_target_site_domain(url: str) -> str | None:
+    """Extract a site:domain restriction from a DuckDuckGo query when present."""
+    query = _duckduckgo_query(url)
+    if not query:
+        return None
+    match = re.search(r"site:([a-z0-9.-]+\.[a-z]{2,})", query)
+    if not match:
+        return None
+    return match.group(1).removeprefix("www.")
+
+
+def _duckduckgo_profile_query_allowed(url: str, ctx: ToolContext) -> bool:
+    """Return True only for focused DuckDuckGo discovery queries that can yield profiles."""
+    if _domain_for_url(url) != "duckduckgo.com":
+        return True
+
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    if parsed.path.rstrip("/") != "/html":
+        return False
+
+    site_domain = _duckduckgo_target_site_domain(url)
+    if not site_domain:
+        return False
+
+    if site_domain in ctx.unavailable_domains:
+        return False
+
+    site_outcome = ctx.domain_outcomes.get(site_domain)
+    if site_outcome and site_outcome.banned_for_run:
+        return False
+
+    return True
 
 
 def _remove_domain_from_candidate_pool(domain: str, ctx: ToolContext) -> None:
@@ -1350,6 +1425,12 @@ def _broad_mode_denied_url(url: str) -> str | None:
 
     if host in {"techcrunch.com", "producthunt.com"} and path == "/":
         return "Startup news or product homepages are not valid broad-mode starter targets."
+
+    if host == "duckduckgo.com":
+        if path != "/html":
+            return "DuckDuckGo starter searches must use the HTML endpoint from suggest_targets, not ad hoc search pages."
+        if "site:" not in _duckduckgo_query(url):
+            return "DuckDuckGo discovery queries must stay site-restricted to profile domains from suggest_targets."
 
     return None
 
@@ -1518,11 +1599,20 @@ async def _sample_discovered_source(
 
         sample_bucket.append({"url": url, "data": dict(data)})
         if len(sample_bucket) < 3:
+            provisional_score, provisional_outcome = _provisional_source_review(sample_bucket, source_stats, ctx)
             print(
                 f"  • Sampled discovered source lead {len(sample_bucket)}/3: {data.get('name') or url}",
                 flush=True,
             )
-            return {"status": "sampled", "url": url, "sample_count": len(sample_bucket), "required_samples": 3}
+            return {
+                "status": "sampled",
+                "url": url,
+                "sample_count": len(sample_bucket),
+                "required_samples": 3,
+                "comparison_ready": len(sample_bucket) >= 2,
+                "provisional_score": provisional_score,
+                "provisional_outcome": provisional_outcome,
+            }
 
         baseline = _baseline_leads(ctx, limit=3)
         source_score, lead_scores = _score_candidate_source(sample_bucket, source_stats, ctx)
@@ -1578,6 +1668,21 @@ async def _sample_discovered_source(
             "source": identifier,
             "score": source_score,
         }
+
+
+def _provisional_source_review(
+    sample_bucket: list[dict[str, Any]],
+    source_stats: SourceRunStats,
+    ctx: ToolContext,
+) -> tuple[int, str]:
+    """Score an in-flight discovered source before the full 3-sample gate is complete."""
+    if len(sample_bucket) < 2:
+        return 0, "insufficient_samples"
+    baseline = _baseline_leads(ctx, limit=3)
+    source_score, _lead_scores = _score_candidate_source(sample_bucket, source_stats, ctx)
+    baseline_score = _baseline_score(baseline, ctx)
+    outcome = _classify_candidate_source(source_score, baseline_score, ctx, exhausted=False)
+    return source_score, outcome
 
 
 async def _flush_sampled_leads(

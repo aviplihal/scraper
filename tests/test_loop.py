@@ -12,6 +12,7 @@ from agent.loop import (
     _candidate_preview_urls,
     _conversation_state_summary,
     _maybe_switch_to_discovery_phase,
+    _normalized_tool_name,
     _maybe_compact_messages,
     _no_viable_next_actions,
     _try_automatic_profile_processing,
@@ -412,6 +413,10 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
         ctx.fetch_budget_counts["github.com:search"] = 20
 
         self.assertTrue(_no_viable_next_actions(ctx))
+
+    def test_normalized_tool_name_maps_finish_job_and_search(self) -> None:
+        self.assertEqual(_normalized_tool_name("finish_job"), "finish_run")
+        self.assertEqual(_normalized_tool_name("search"), "suggest_targets")
 
     def test_switch_to_discovery_phase_when_pass1_pool_is_exhausted(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

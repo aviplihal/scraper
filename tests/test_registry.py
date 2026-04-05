@@ -161,6 +161,68 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("gitlab.com", result["allowed_domains"])
         self.assertTrue(all(target["domain"] != "gitlab.com" for target in result["candidate_targets"]))
 
+    async def test_unchanged_suggest_targets_refilters_domains_banned_after_first_brief(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 10,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+            source_phase="discovery",
+        )
+        ctx.domain_outcomes["gitlab.com"] = DomainOutcome(blocked_count=1, banned_for_run=True)
+        ctx.suggest_targets_called = True
+        ctx.last_suggest_targets_signature = (
+            "discovery",
+            0,
+            0,
+            0,
+            0,
+            0,
+            tuple(),
+            ("gitlab.com",),
+        )
+        ctx.suggested_targets = [
+            {"url": "https://duckduckgo.com/html?q=site%3Agithub.com+%22Engineer%22", "domain": "duckduckgo.com"},
+            {"url": "https://duckduckgo.com/html?q=site%3Agitlab.com+%22Engineer%22", "domain": "duckduckgo.com"},
+        ]
+        ctx.candidate_domains = ["duckduckgo.com"]
+        ctx.allowed_domains = {"duckduckgo.com"}
+
+        result = await dispatch_tool("suggest_targets", {"limit": 8}, ctx)
+
+        urls = [target["url"] for target in result["candidate_targets"]]
+        self.assertEqual(result["status"], "unchanged")
+        self.assertEqual(urls, ["https://duckduckgo.com/html?q=site%3Agithub.com+%22Engineer%22"])
+
+    async def test_suggest_targets_filters_duckduckgo_queries_for_banned_follow_on_domains(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 10,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+            source_phase="discovery",
+        )
+        ctx.domain_outcomes["gitlab.com"] = DomainOutcome(blocked_count=1, banned_for_run=True)
+
+        result = await dispatch_tool("suggest_targets", {"limit": 8}, ctx)
+
+        urls = [target["url"] for target in result["candidate_targets"]]
+        self.assertTrue(all("site%3Agitlab.com" not in url for url in urls))
+
     async def test_suggest_targets_returns_curated_leadership_targets(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
@@ -234,6 +296,33 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("error", result)
         self.assertIn("outside the candidate domain pool", result["error"])
+
+    async def test_broad_mode_rejects_ad_hoc_duckduckgo_query_without_site_filter(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 10,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"duckduckgo.com"}
+        ctx.candidate_domains = ["duckduckgo.com"]
+        result = await dispatch_tool(
+            "fetch_page",
+            {"url": "https://duckduckgo.com/html?q=Senior+Software+Engineer+profile", "needs_javascript": False},
+            ctx,
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("site-restricted", result["error"])
 
     async def test_broad_mode_allows_model_selected_url_within_allowed_domain_pool(self) -> None:
         writer = _DummyWriter()
@@ -1153,6 +1242,28 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writer.saved_count, 1)
         self.assertEqual(writer.duplicate_count, 1)
 
+    async def test_save_result_short_circuits_when_storage_already_has_url(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 2},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        writer._saved_urls.add(_normalize_url("https://example.com/alice"))
+
+        result = await dispatch_tool(
+            "save_result",
+            {
+                "url": "https://example.com/alice",
+                "data": {"name": "Alice Smith", "job_title": "CTO"},
+            },
+            ctx,
+        )
+
+        self.assertEqual(result["status"], "duplicate")
+        self.assertEqual(writer.saved_count, 0)
+        self.assertEqual(writer.duplicate_count, 1)
+
     async def test_fail_url_accepts_fetch_id_without_url(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
@@ -1298,6 +1409,69 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["status"], "temporary_seed")
                 self.assertIn("gitlab.com", state.temporary_seed_sources()["web_domains"])
                 self.assertEqual(writer.saved_count, 3)
+            finally:
+                os.chdir(old_cwd)
+
+    async def test_discovered_source_starts_provisional_review_on_second_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "website": "NA",
+                        "min_leads": 1,
+                        "source_accuracy": "balanced",
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "website": "NA",
+                        "min_leads": 1,
+                        "source_accuracy": "balanced",
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                        "job_title": "Senior Software Engineer",
+                        "job": "find engineers",
+                        "area": "NA",
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="discovery",
+                )
+                ctx.current_run_saved_leads.append(
+                    {
+                        "url": "https://github.com/alice",
+                        "data": {"name": "Alice Smith", "job_title": "Senior Software Engineer", "company": "Example"},
+                        "source_status": "approved",
+                    }
+                )
+
+                await dispatch_tool(
+                    "save_result",
+                    {
+                        "url": "https://gitlab.com/user0",
+                        "data": {"name": "Engineer 0", "job_title": "Senior Software Engineer", "company": "Example Co"},
+                    },
+                    ctx,
+                )
+                second = await dispatch_tool(
+                    "save_result",
+                    {
+                        "url": "https://gitlab.com/user1",
+                        "data": {"name": "Engineer 1", "job_title": "Senior Software Engineer", "company": "Example Co"},
+                    },
+                    ctx,
+                )
+
+                self.assertEqual(second["status"], "sampled")
+                self.assertTrue(second["comparison_ready"])
+                self.assertEqual(second["sample_count"], 2)
             finally:
                 os.chdir(old_cwd)
 
