@@ -59,6 +59,20 @@ _GENERIC_PROFILE_SELECTORS: dict[str, list[str]] = {
         "a[href*='github.com']",
     ],
 }
+_COMPANY_TEAM_HINTS = {
+    "team",
+    "platform",
+    "engineering",
+    "developer",
+    "software",
+    "product",
+    "security",
+    "data",
+    "devops",
+    "infrastructure",
+    "cloud",
+    "ai",
+}
 
 # Social-media domains that must be routed to the human emulator
 SOCIAL_MEDIA_DOMAINS: frozenset[str] = frozenset(
@@ -120,6 +134,7 @@ class ToolContext:
     client_config:  dict
     sheets_writer:  Any                              # storage.writer.StorageWriter
     source_mode:    str             = "web"
+    effective_source_mode: str | None = None
     source_phase:   str             = "pass1"
     target_domain:  str | None      = None
     scraper_browser: Any | None      = None          # tools.browser.ScraperBrowser
@@ -156,9 +171,13 @@ class ToolContext:
     discovery_source_samples: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     current_run_saved_leads: list[dict[str, Any]] = field(default_factory=list)
     social_profile_hints: dict[str, dict[str, Any]] = field(default_factory=dict)
+    active_social_platforms: set[str] = field(default_factory=set)
+    unavailable_social_platforms: set[str] = field(default_factory=set)
+    unavailable_domains: set[str] = field(default_factory=set)
     terminal_url_outcomes: dict[str, str] = field(default_factory=dict)
     discovery_seen_links: dict[str, set[str]] = field(default_factory=dict)
     exhausted_discovery_fetches: set[str] = field(default_factory=set)
+    exhausted_discovery_urls: set[str] = field(default_factory=set)
     fetch_parent_seeds: dict[str, str] = field(default_factory=dict)
     social_blank_seed_counts: dict[str, int] = field(default_factory=dict)
     social_platform_failures: dict[str, int] = field(default_factory=dict)
@@ -429,6 +448,8 @@ def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
         len(ctx.failed_urls),
         len(ctx.terminal_url_outcomes),
         len(ctx.low_yield_platforms),
+        len(ctx.exhausted_discovery_urls),
+        tuple(sorted(ctx.unavailable_domains)),
     )
     if (
         ctx.suggest_targets_called
@@ -441,18 +462,23 @@ def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
             "strategy": ctx.target_strategy or "unknown",
             "keyword_brief": dict(ctx.keyword_brief),
             "allowed_domains": list(ctx.candidate_domains or sorted(ctx.allowed_domains)),
-            "candidate_targets": list(ctx.suggested_targets[:3]),
-            "message": "Target brief unchanged in the current source phase.",
+            "candidate_targets": list(ctx.suggested_targets[:1]),
+            "message": "Target brief unchanged in the current source phase. Continue the current viable seed or remaining candidate domains.",
         }
 
     result = suggest_targets(
         ctx.client_config,
-        ctx.source_mode,
+        ctx.effective_source_mode or ctx.source_mode,
         limit=max(1, min(int(limit), 20)),
         source_state=ctx.source_state,
         phase=ctx.source_phase,
     )
-    targets = result.get("candidate_targets", [])
+    targets = _filter_candidate_targets(
+        result.get("candidate_targets", []),
+        ctx,
+    )
+    result["candidate_targets"] = targets
+    result["allowed_domains"] = _ordered_target_domains(targets)
     ctx.suggest_targets_called = True
     ctx.suggested_targets = list(targets)
     ctx.target_strategy = str(result.get("strategy", "unknown"))
@@ -491,6 +517,13 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
     normalized_url = _normalize_url(url)
     domain = _domain_for_url(url)
 
+    if normalized_url in ctx.exhausted_discovery_urls:
+        ctx.fetch_error_count += 1
+        return {
+            "error": "Discovery/search URL is exhausted for this run. Continue with a different seed or domain.",
+            "url": url,
+        }
+
     terminal_outcome = _terminal_outcome_for_url(url, ctx)
     if terminal_outcome:
         ctx.fetch_error_count += 1
@@ -501,6 +534,12 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
 
     if normalized_url in ctx.url_to_fetch_id:
         fetch_id = ctx.url_to_fetch_id[normalized_url]
+        if fetch_id in ctx.exhausted_discovery_fetches:
+            ctx.fetch_error_count += 1
+            return {
+                "error": "Discovery/search URL is exhausted for this run. Continue with a different seed or domain.",
+                "url": url,
+            }
         cached = ctx.fetch_metadata[fetch_id].copy()
         cached["fetch_id"] = fetch_id
         if fetch_id in ctx.exhausted_discovery_fetches:
@@ -512,6 +551,13 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
             ctx.fetch_error_count += 1
             return {
                 "error": "Social-media URLs are not allowed in web mode.",
+                "url": url,
+            }
+
+        if domain in ctx.unavailable_domains:
+            ctx.fetch_error_count += 1
+            return {
+                "error": f"Social platform '{domain}' is unavailable for this run. Choose another active candidate domain.",
                 "url": url,
             }
 
@@ -638,6 +684,7 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
     availability = ctx.emulator_state.availability(platform)
     if availability["status"] in {"missing_credentials", "paused", "unavailable"}:
         reason = availability["reason"] or availability["status"]
+        _mark_social_platform_unavailable(platform, reason, ctx)
         return {
             "error": f"Social platform '{platform}' is currently unavailable: {reason}",
             "url": url,
@@ -657,12 +704,14 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
         ctx.emulator_state.record_restriction(platform)
         ctx.emulator_state.set_pause_hours(platform, hours=8, reason=str(exc))
         ctx.emulator_state.set_availability(platform, "paused", str(exc))
+        _mark_social_platform_unavailable(platform, str(exc), ctx)
         return {
             "error": f"Social platform '{platform}' hit a checkpoint and has been paused: {exc}",
             "url": url,
         }
     except Exception as exc:
         ctx.emulator_state.set_availability(platform, "unavailable", str(exc))
+        _mark_social_platform_unavailable(platform, str(exc), ctx)
         return {
             "error": f"Social fetch failed for platform '{platform}': {exc}",
             "url": url,
@@ -792,6 +841,7 @@ def _tool_list_links(
     exhausted = len(eligible_links) < 2 or not remaining_candidates
     if exhausted:
         ctx.exhausted_discovery_fetches.add(fetch_id)
+        ctx.exhausted_discovery_urls.add(_normalize_url(base_url))
 
     return {"links": unseen_links, "count": len(unseen_links), "exhausted": exhausted}
 
@@ -834,6 +884,7 @@ def _tool_parse_html(
 
 
 async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
+    data = _normalize_lead_payload(url, data)
     source_stats = _source_stats_for_url(url, ctx)
     viable, reason = _is_minimally_viable_lead(data, url)
     if not viable:
@@ -1029,11 +1080,75 @@ def _has_alternative_allowed_domain(url: str, ctx: ToolContext) -> bool:
     for domain in ctx.candidate_domains or sorted(ctx.allowed_domains):
         if domain == current_domain:
             continue
+        if domain in ctx.unavailable_domains:
+            continue
         outcome = ctx.domain_outcomes.get(domain)
         if outcome and outcome.banned_for_run:
             continue
         return True
     return False
+
+
+def _filter_candidate_targets(targets: list[dict[str, Any]], ctx: ToolContext) -> list[dict[str, Any]]:
+    """Filter out unavailable or exhausted starter targets for this run."""
+    filtered: list[dict[str, Any]] = []
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        url = str(target.get("url", "")).strip()
+        domain = str(target.get("domain", "")).strip().lower() or _domain_for_url(url)
+        if not url or not domain:
+            continue
+        if domain in ctx.unavailable_domains:
+            continue
+        if domain == "linkedin.com" and "linkedin" in ctx.low_yield_platforms:
+            continue
+        if domain in {"x.com", "twitter.com"} and "x" in ctx.low_yield_platforms:
+            continue
+        if _normalize_url(url) in ctx.exhausted_discovery_urls:
+            continue
+        if _terminal_outcome_for_url(url, ctx):
+            continue
+        filtered.append(target)
+    return filtered
+
+
+def _ordered_target_domains(targets: list[dict[str, Any]]) -> list[str]:
+    """Return ordered unique domains from the current target set."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for target in targets:
+        domain = str(target.get("domain", "")).strip().lower()
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        ordered.append(domain)
+    return ordered
+
+
+def _remove_domain_from_candidate_pool(domain: str, ctx: ToolContext) -> None:
+    """Remove a domain from the current run-local candidate pool."""
+    ctx.allowed_domains.discard(domain)
+    ctx.candidate_domains = [candidate for candidate in ctx.candidate_domains if candidate != domain]
+    ctx.suggested_targets = [
+        target for target in ctx.suggested_targets
+        if str(target.get("domain", "")).strip().lower() != domain
+    ]
+    ctx.suggested_target_urls = {
+        url for url in ctx.suggested_target_urls
+        if _domain_for_url(url) != domain
+    }
+
+
+def _mark_social_platform_unavailable(platform: str, reason: str, ctx: ToolContext) -> None:  # noqa: ARG001
+    """Mark a social platform unavailable for the rest of the current run."""
+    ctx.active_social_platforms.discard(platform)
+    ctx.unavailable_social_platforms.add(platform)
+    domain = domain_for_platform(platform)
+    ctx.unavailable_domains.add(domain)
+    _remove_domain_from_candidate_pool(domain, ctx)
+    if ctx.source_mode == "all" and not ctx.active_social_platforms:
+        ctx.effective_source_mode = "web"
 
 
 def _same_or_subdomain(host: str, target_host: str) -> bool:
@@ -1535,6 +1650,149 @@ def _has_meaningful_value(value: Any) -> bool:
     if isinstance(value, (list, tuple, set, dict)):
         return bool(value)
     return True
+
+
+def _normalize_lead_payload(source_url: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Clean noisy extracted lead fields without inventing new facts."""
+    normalized = dict(data or {})
+    for key, value in list(normalized.items()):
+        if isinstance(value, str):
+            cleaned = _clean_field_text(value)
+            normalized[key] = cleaned if cleaned else None
+
+    normalized["job_title"] = _normalize_job_title_value(normalized.get("job_title"))
+    normalized["company"] = _normalize_company_value(normalized.get("company"))
+    normalized["social_media"] = _normalize_social_value(normalized.get("social_media"), source_url)
+    normalized["website"] = _normalize_website_value(
+        normalized.get("website"),
+        fallback_social=normalized.get("social_media"),
+    )
+    return normalized
+
+
+def _clean_field_text(value: str) -> str:
+    """Collapse noisy whitespace in extracted fields."""
+    return " ".join(value.replace("\xa0", " ").split())
+
+
+def _normalize_job_title_value(value: Any) -> Any:
+    """Trim common GitHub-style title noise while preserving a plausible role."""
+    if not isinstance(value, str):
+        return value
+    text = _clean_field_text(value)
+    if not text:
+        return None
+
+    first_line = value.splitlines()[0].strip()
+    if first_line and _looks_like_title_fragment(first_line):
+        text = _clean_field_text(first_line)
+
+    if "@" in text:
+        first_segment = _clean_field_text(text.split("@", 1)[0])
+        if first_segment and _looks_like_title_fragment(first_segment):
+            text = first_segment
+
+    if " {" in text and _looks_like_title_fragment(text.split(" {", 1)[0].strip()):
+        text = text.split(" {", 1)[0].strip()
+
+    return text or None
+
+
+def _normalize_company_value(value: Any) -> Any:
+    """Simplify common company strings without guessing across multiple employers."""
+    if not isinstance(value, str):
+        return value
+    text = _clean_field_text(value)
+    if not text:
+        return None
+
+    tokens = [_humanize_org_token(token) for token in text.split("@") if token.strip()]
+    if text.startswith("@") and tokens:
+        return tokens[0]
+
+    if len(tokens) >= 2:
+        first_token_lower = tokens[0].lower()
+        if any(term in first_token_lower for term in _COMPANY_TEAM_HINTS):
+            return tokens[-1]
+
+    return text
+
+
+def _normalize_social_value(value: Any, source_url: str) -> Any:
+    """Normalize social/profile values while preserving the original source URL when helpful."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return None
+    if text.startswith("in/"):
+        return f"https://www.linkedin.com/{text}"
+    if text.startswith("www."):
+        return f"https://{text}"
+    if text.startswith("http://") or text.startswith("https://"):
+        return text
+    if _domain_for_url(source_url) in {"linkedin.com", "x.com", "twitter.com"}:
+        return source_url
+    return text
+
+
+def _normalize_website_value(value: Any, fallback_social: Any = None) -> Any:
+    """Keep websites normalized and promote non-social URLs into website when useful."""
+    if isinstance(value, str) and value.strip():
+        website = value.strip()
+    elif isinstance(fallback_social, str) and fallback_social.strip() and not _looks_like_social_profile_url(fallback_social):
+        website = fallback_social.strip()
+    else:
+        return value
+
+    if website.startswith("www."):
+        return f"https://{website}"
+    return website
+
+
+def _looks_like_title_fragment(value: str) -> bool:
+    """Return True when a fragment looks like a plausible job title."""
+    lowered = value.strip().lower()
+    if not lowered:
+        return False
+    return any(
+        token in lowered
+        for token in (
+            "engineer",
+            "developer",
+            "architect",
+            "founder",
+            "chief",
+            "cto",
+            "manager",
+            "director",
+            "lead",
+            "scientist",
+            "analyst",
+            "designer",
+            "sales",
+            "marketing",
+            "product",
+            "quality",
+        )
+    )
+
+
+def _humanize_org_token(value: str) -> str:
+    """Turn simple handle-like company tokens into readable text."""
+    token = value.strip().strip("@")
+    if not token:
+        return token
+    token = token.replace("_", " ").replace("-", " ")
+    if token.islower():
+        return token.title()
+    return token
+
+
+def _looks_like_social_profile_url(value: str) -> bool:
+    """Return True when a value already points at a social/profile URL."""
+    domain = _domain_for_url(value)
+    return domain in {"linkedin.com", "x.com", "twitter.com", "github.com", "gitlab.com"}
 
 
 def _is_minimally_viable_lead(data: dict[str, Any], source_url: str) -> tuple[bool, str]:

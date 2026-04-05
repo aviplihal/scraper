@@ -101,6 +101,31 @@ class DiscoveryTests(unittest.TestCase):
             ],
         )
 
+    def test_extract_links_filters_github_user_search_junk_links(self) -> None:
+        html = """
+        <html>
+          <body>
+            <a href="/team">Team</a>
+            <a href="/topics">Topics</a>
+            <a href="/alice-smith">Alice Smith</a>
+            <a href="/bob-jones">Bob Jones</a>
+          </body>
+        </html>
+        """
+
+        links = extract_links(
+            html,
+            "https://github.com/search?q=senior+software+engineer&type=users",
+        )
+
+        self.assertEqual(
+            links,
+            [
+                {"url": "https://github.com/alice-smith", "text": "Alice Smith"},
+                {"url": "https://github.com/bob-jones", "text": "Bob Jones"},
+            ],
+        )
+
     def test_extract_links_same_domain_only(self) -> None:
         html = """
         <html>

@@ -12,7 +12,7 @@ from agent.loop import run_agent_loop
 from human_emulator.browser import EmulatorBrowser
 from human_emulator.platforms import adapter_for_platform
 from human_emulator.state import EmulatorState
-from source_state import SourceState
+from source_state import SourceState, domain_for_platform
 from storage.writer import StorageWriter
 # To switch back to Google Sheets, replace the line above with:
 #   from sheets.writer import SheetsWriter
@@ -56,6 +56,7 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
         client_config    = config,
         sheets_writer    = writer,
         source_mode      = source,
+        effective_source_mode = source,
         target_domain    = _target_domain_for_config(config),
         scraper_browser  = scraper,
         emulator_browser = emulator_browser,
@@ -113,6 +114,7 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
         client_config    = config,
         sheets_writer    = writer,
         source_mode      = "human_emulator",
+        effective_source_mode = "human_emulator",
         target_domain    = _target_domain_for_config(config),
         emulator_browser = emulator_browser,
         emulator_state   = emulator_state,
@@ -179,6 +181,8 @@ def _print_run_summary(
     print(f"Status     : {summary_status}")
     print(f"Client     : {config['client_id']}")
     print(f"Source     : {source}")
+    if (ctx.effective_source_mode or source) != source:
+        print(f"Effective source: {ctx.effective_source_mode}")
     print(f"Output DB  : {writer.db_path}")
     print(f"Lead target: {lead_target}")
     print(f"Steps run  : {run_result['steps_run']}")
@@ -300,10 +304,16 @@ async def _preflight_social_platforms(config: dict, ctx: ToolContext) -> None:
     if ctx.emulator_browser is None or ctx.emulator_state is None:
         return
 
+    ctx.active_social_platforms.clear()
+    ctx.unavailable_social_platforms.clear()
+    ctx.unavailable_domains.clear()
+
     for platform in _social_platforms_for_config(config):
         adapter_cls = adapter_for_platform(platform)
         if adapter_cls is None:
             ctx.emulator_state.set_availability(platform, "unavailable", "Unsupported social platform.")
+            ctx.unavailable_social_platforms.add(platform)
+            ctx.unavailable_domains.add(domain_for_platform(platform))
             continue
 
         context = await ctx.emulator_browser.get_context(platform)
@@ -312,6 +322,13 @@ async def _preflight_social_platforms(config: dict, ctx: ToolContext) -> None:
         ctx.emulator_state.set_availability(platform, status, reason)
         if status == "active":
             ctx.social_adapters[platform] = adapter
+            ctx.active_social_platforms.add(platform)
+        else:
+            ctx.unavailable_social_platforms.add(platform)
+            ctx.unavailable_domains.add(domain_for_platform(platform))
+
+    if ctx.source_mode == "all":
+        ctx.effective_source_mode = "all" if ctx.active_social_platforms else "web"
 
 
 def _has_active_social_platform(ctx: ToolContext, platforms: list[str]) -> bool:

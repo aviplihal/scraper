@@ -20,6 +20,7 @@ from tools.registry import (
     ToolContext,
     _curated_target_pool_exhausted,
     _domain_for_url,
+    _normalize_url,
     dispatch_tool,
 )
 
@@ -29,6 +30,8 @@ MODEL      = "qwen3.5:9b"
 MAX_STEPS  = 100
 _PROMPT_TOKEN_COMPACT_THRESHOLD = 2500
 _MESSAGE_COMPACT_THRESHOLD = 12
+_MESSAGE_COMPACT_HARD_THRESHOLD = 22
+_COMPACTION_MIN_NEW_MESSAGES = 10
 _AUTO_PROFILE_BATCH_SIZE = 2
 _FAKE_TOOL_CALL_PATTERN = re.compile(r"\b(fetch_page|fetch_url|list_links|parse_html|save_result|fail_url|suggest_targets)\s*\(")
 
@@ -52,6 +55,7 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
         "total_tokens": 0,
         "max_prompt_tokens": 0,
         "compactions": 0,
+        "last_compaction_non_system_messages": 0,
     }
 
     print("\n=== Job Start ===")
@@ -328,10 +332,14 @@ def _safe_int(value: object) -> int:
 def _maybe_compact_messages(messages: list[dict], ctx: ToolContext, run_result: dict) -> None:
     """Compact older conversation history when prompt state grows too large."""
     non_system_messages = max(0, len(messages) - 2)
-    if (
-        run_result.get("last_prompt_tokens", 0) <= _PROMPT_TOKEN_COMPACT_THRESHOLD
-        and non_system_messages <= _MESSAGE_COMPACT_THRESHOLD
-    ):
+    growth_since_compaction = non_system_messages - run_result.get("last_compaction_non_system_messages", 0)
+    prompt_trigger = (
+        run_result.get("last_prompt_tokens", 0) > _PROMPT_TOKEN_COMPACT_THRESHOLD
+        and non_system_messages >= _MESSAGE_COMPACT_THRESHOLD
+        and growth_since_compaction >= _COMPACTION_MIN_NEW_MESSAGES
+    )
+    message_trigger = non_system_messages >= _MESSAGE_COMPACT_HARD_THRESHOLD
+    if not prompt_trigger and not message_trigger:
         return
     if len(messages) <= 3:
         return
@@ -343,6 +351,7 @@ def _maybe_compact_messages(messages: list[dict], ctx: ToolContext, run_result: 
     }
     messages[:] = messages[:2] + [summary_message] + tail
     run_result["compactions"] = run_result.get("compactions", 0) + 1
+    run_result["last_compaction_non_system_messages"] = max(0, len(messages) - 2)
 
 
 def _conversation_state_summary(ctx: ToolContext) -> str:
@@ -850,6 +859,8 @@ def _remaining_candidate_domains(ctx: ToolContext) -> list[str]:
     remaining: list[str] = []
     fetched_domains = _fetched_candidate_domains(ctx)
     for domain in ctx.candidate_domains or sorted(ctx.allowed_domains):
+        if domain in getattr(ctx, "unavailable_domains", set()):
+            continue
         outcome = ctx.domain_outcomes.get(domain)
         if outcome and outcome.banned_for_run:
             continue
@@ -893,7 +904,12 @@ def _candidate_preview_urls(ctx: ToolContext, limit: int = 3) -> list[str]:
                 if str(target.get("domain", "")).strip() != domain:
                     continue
                 url = str(target.get("url", "")).strip()
-                if not url or url in preview_urls:
+                if (
+                    not url
+                    or url in preview_urls
+                    or _domain_for_url(url) in getattr(ctx, "unavailable_domains", set())
+                    or _normalize_url(url) in getattr(ctx, "exhausted_discovery_urls", set())
+                ):
                     continue
                 preview_urls.append(url)
                 break
@@ -902,7 +918,12 @@ def _candidate_preview_urls(ctx: ToolContext, limit: int = 3) -> list[str]:
 
     for target in prioritized_targets:
         url = str(target.get("url", "")).strip()
-        if not url or url in preview_urls:
+        if (
+            not url
+            or url in preview_urls
+            or _domain_for_url(url) in getattr(ctx, "unavailable_domains", set())
+            or _normalize_url(url) in getattr(ctx, "exhausted_discovery_urls", set())
+        ):
             continue
         preview_urls.append(url)
         if len(preview_urls) >= limit:

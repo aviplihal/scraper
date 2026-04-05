@@ -109,6 +109,31 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["strategy"], "technical_profiles")
         self.assertEqual(second["status"], "unchanged")
         self.assertEqual(second["phase"], "pass1")
+        self.assertLessEqual(len(second["candidate_targets"]), 1)
+
+    async def test_suggest_targets_filters_unavailable_social_domains(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 1,
+                "social_platforms": ["linkedin", "x"],
+            },
+            sheets_writer=writer,
+            source_mode="all",
+            effective_source_mode="web",
+        )
+        ctx.unavailable_domains.update({"linkedin.com", "x.com"})
+
+        result = await dispatch_tool("suggest_targets", {"limit": 6}, ctx)
+
+        self.assertNotIn("linkedin.com", result["allowed_domains"])
+        self.assertNotIn("x.com", result["allowed_domains"])
+        self.assertTrue(all(target["domain"] not in {"linkedin.com", "x.com"} for target in result["candidate_targets"]))
 
     async def test_suggest_targets_returns_curated_leadership_targets(self) -> None:
         writer = _DummyWriter()
@@ -339,6 +364,29 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(first["links"]), 2)
         self.assertEqual(len(second["links"]), 1)
         self.assertTrue(second["exhausted"])
+
+    async def test_exhausted_search_url_cannot_be_refetched(self) -> None:
+        writer = _DummyWriter()
+        search_url = "https://github.com/search?q=engineer&type=users"
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+            scraper_browser=_FakeScraperBrowser(),
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"github.com"}
+        ctx.candidate_domains = ["github.com"]
+        ctx.exhausted_discovery_urls.add(_normalize_url(search_url))
+
+        result = await dispatch_tool(
+            "fetch_page",
+            {"url": search_url, "needs_javascript": False},
+            ctx,
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("exhausted", result["error"])
 
     def test_social_profile_urls_canonicalize_mini_profile_variants(self) -> None:
         self.assertEqual(
@@ -755,6 +803,33 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "saved")
         self.assertEqual(writer.saved_count, 1)
+
+    async def test_save_result_normalizes_noisy_job_title_and_company(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        result = await dispatch_tool(
+            "save_result",
+            {
+                "url": "https://github.com/example-user",
+                "data": {
+                    "name": "Example User",
+                    "job_title": "Senior Software Engineer\n{ Work and reside in San Francisco }",
+                    "company": "Data Platform@twilio",
+                    "social_media": "www.example.com",
+                },
+            },
+            ctx,
+        )
+
+        self.assertEqual(result["status"], "saved")
+        self.assertEqual(writer.saved_rows[0]["data"]["job_title"], "Senior Software Engineer")
+        self.assertEqual(writer.saved_rows[0]["data"]["company"], "Twilio")
+        self.assertEqual(writer.saved_rows[0]["data"]["social_media"], "https://www.example.com")
 
     async def test_duplicate_saved_row_does_not_increment_saved_count(self) -> None:
         writer = _DummyWriter()

@@ -282,6 +282,7 @@ def extract_links(
     soup = BeautifulSoup(html, "html.parser")
     anchors = _select_anchors(soup, base_url, selector)
     base_host = _normalize_host(urlparse(base_url).netloc)
+    github_user_search = _is_github_user_search(base_url)
     ranked_links: list[tuple[int, str, str]] = []
 
     for anchor in anchors:
@@ -297,6 +298,8 @@ def extract_links(
             continue
 
         text = anchor.get_text(separator=" ", strip=True)
+        if github_user_search and not _is_github_profile_url(normalized_url):
+            continue
         score = _score_link(anchor, normalized_url, text, base_url)
         if selector is None and score <= 0:
             continue
@@ -453,6 +456,19 @@ def _select_anchors(soup: BeautifulSoup, base_url: str, selector: str | None):
             return specific
 
     return soup.select("a[href]")
+
+
+def _is_github_user_search(base_url: str) -> bool:
+    parsed = urlparse(base_url)
+    return _normalize_host(parsed.netloc) == "github.com" and parsed.path.lower() == "/search" and "type=users" in parsed.query.lower()
+
+
+def _is_github_profile_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if _normalize_host(parsed.netloc) != "github.com":
+        return False
+    path_segments = [segment for segment in parsed.path.split("/") if segment]
+    return len(path_segments) == 1 and path_segments[0] not in _GITHUB_RESERVED_SEGMENTS
 
 
 def _score_link(anchor, normalized_url: str, text: str, base_url: str) -> int:
