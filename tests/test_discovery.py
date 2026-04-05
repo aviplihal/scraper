@@ -158,6 +158,46 @@ class DiscoveryTests(unittest.TestCase):
 
         self.assertEqual(links, [{"url": "https://example.com/team/alice", "text": "Alice"}])
 
+    def test_extract_links_unwraps_duckduckgo_result_urls(self) -> None:
+        html = """
+        <html>
+          <body>
+            <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fejokelly%2F">
+              EJ O'Kelly
+            </a>
+            <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fcontactout.com%2Fcompany%2Fgithub">
+              ContactOut
+            </a>
+          </body>
+        </html>
+        """
+
+        links = extract_links(
+            html,
+            "https://html.duckduckgo.com/html/?q=site%3Agithub.com+%22Senior+Software+Engineer%22+%22San+Francisco%22",
+        )
+
+        self.assertEqual(
+            links,
+            [{"url": "https://github.com/ejokelly", "text": "EJ O'Kelly"}],
+        )
+
+    def test_classify_duckduckgo_error_page_as_blocked(self) -> None:
+        html = """
+        <html>
+          <head><title>DuckDuckGo</title></head>
+          <body>Error getting results 418</body>
+        </html>
+        """
+
+        page_info = classify_page(
+            "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fejokelly%2F",
+            "https://duckduckgo.com/static-pages/418.html?bno=84f2",
+            html,
+        )
+
+        self.assertEqual(page_info.page_kind, "blocked")
+
     def test_extract_links_prefers_people_links_from_company_page(self) -> None:
         html = """
         <html>

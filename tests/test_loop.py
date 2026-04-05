@@ -575,6 +575,47 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["completion_tokens"], 45)
         self.assertEqual(result["total_tokens"], 168)
 
+    async def test_run_retries_once_after_recoverable_model_xml_error(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find engineers",
+                "job_title": "Engineer",
+                "area": "NA",
+                "website": "https://github.com",
+                "min_leads": 1,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        class _FakeClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def chat(self, **_: object) -> SimpleNamespace:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError(
+                        "XML syntax error on line 9: element <function> closed by </parameter> (status code: 500)"
+                    )
+                return SimpleNamespace(
+                    prompt_eval_count=10,
+                    eval_count=1,
+                    message=SimpleNamespace(content="", tool_calls=[]),
+                )
+
+        fake_client = _FakeClient()
+
+        with patch("agent.loop.ollama.AsyncClient", return_value=fake_client):
+            result = await run_agent_loop(ctx.client_config, "web", ctx)
+
+        self.assertEqual(fake_client.calls, 2)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result.get("model_error_retries"), 1)
+        self.assertNotIn("Ollama call failed", result["stop_reason"])
+
     def test_compactor_reduces_history_and_records_summary(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(

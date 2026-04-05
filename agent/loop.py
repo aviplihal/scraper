@@ -34,6 +34,11 @@ _MESSAGE_COMPACT_HARD_THRESHOLD = 22
 _COMPACTION_MIN_NEW_MESSAGES = 10
 _AUTO_PROFILE_BATCH_SIZE = 2
 _FAKE_TOOL_CALL_PATTERN = re.compile(r"\b(fetch_page|fetch_url|list_links|parse_html|save_result|fail_url|suggest_targets)\s*\(")
+_RECOVERABLE_MODEL_ERROR_PATTERNS = (
+    "xml syntax error",
+    "closed by </parameter>",
+    "closed by </function>",
+)
 
 
 async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
@@ -106,6 +111,8 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                         "Recovered from Ollama tool-call failure but could not reach the lead target",
                     )
                 break
+            if await _recover_from_model_call_error(ctx, messages, step, exc, run_result):
+                continue
             logger.error("Ollama call failed at step %d: %s", step, exc)
             print(f"[agent] ERROR: Ollama call failed — {exc}")
             run_result["status"] = "error"
@@ -352,6 +359,55 @@ def _maybe_compact_messages(messages: list[dict], ctx: ToolContext, run_result: 
     messages[:] = messages[:2] + [summary_message] + tail
     run_result["compactions"] = run_result.get("compactions", 0) + 1
     run_result["last_compaction_non_system_messages"] = max(0, len(messages) - 2)
+
+
+def _force_compact_messages(messages: list[dict], ctx: ToolContext, run_result: dict) -> None:
+    """Compact history immediately after a model-format failure so the retry starts cleaner."""
+    if len(messages) <= 3:
+        return
+    tail = messages[2:][-6:]
+    summary_message = {
+        "role": "user",
+        "content": _conversation_state_summary(ctx),
+    }
+    messages[:] = messages[:2] + [summary_message] + tail
+    run_result["compactions"] = run_result.get("compactions", 0) + 1
+    run_result["last_compaction_non_system_messages"] = max(0, len(messages) - 2)
+
+
+def _is_recoverable_model_call_error(exc: Exception) -> bool:
+    """Return True for malformed structured-output failures that are worth one retry."""
+    message = str(exc).lower()
+    return any(pattern in message for pattern in _RECOVERABLE_MODEL_ERROR_PATTERNS)
+
+
+async def _recover_from_model_call_error(
+    ctx: ToolContext,
+    messages: list[dict],
+    step: int,
+    exc: Exception,
+    run_result: dict,
+) -> bool:
+    """Try one lightweight recovery pass after malformed model tool output."""
+    if not _is_recoverable_model_call_error(exc):
+        return False
+    if run_result.get("model_error_retries", 0) >= 1:
+        return False
+
+    await _auto_fail_remaining_non_actionable_pages(ctx, messages, step)
+    _force_compact_messages(messages, ctx, run_result)
+    reminder = (
+        "The previous model response failed because its tool-call markup was malformed. "
+        "Continue with direct tool calls only. Process any outstanding fetched pages first, "
+        "then continue from the current discovery seed. Do not emit XML-like markup or pseudo-tool calls."
+    )
+    messages.append({"role": "user", "content": reminder})
+    run_result["model_error_retries"] = run_result.get("model_error_retries", 0) + 1
+    print(
+        f"[agent] Recovering from malformed model tool output at step {step}; compacting history and retrying once.",
+        flush=True,
+    )
+    return True
 
 
 def _conversation_state_summary(ctx: ToolContext) -> str:

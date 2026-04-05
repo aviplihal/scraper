@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
@@ -225,6 +226,9 @@ _GITHUB_RESERVED_SEGMENTS = {
     "why-github",
 }
 
+_DUCKDUCKGO_HOSTS = {"duckduckgo.com", "html.duckduckgo.com"}
+_DISCOVERY_PROFILE_DOMAINS = {"github.com", "gitlab.com", "linkedin.com", "x.com", "twitter.com"}
+
 
 @dataclass(slots=True)
 class PageInfo:
@@ -248,6 +252,9 @@ def classify_page(url: str, final_url: str, html: str) -> PageInfo:
     host = _normalize_host(parsed.netloc)
     path_segments = [segment for segment in path.split("/") if segment]
 
+    if _looks_like_duckduckgo_error_page(host, path, title_lower, text_lower):
+        return PageInfo(final_url=final_url or url, title=title, page_kind="blocked")
+
     if _contains_marker(title_lower, text_lower, _BLOCKED_MARKERS):
         return PageInfo(final_url=final_url or url, title=title, page_kind="blocked")
 
@@ -256,6 +263,9 @@ def classify_page(url: str, final_url: str, html: str) -> PageInfo:
 
     if _contains_marker(title_lower, text_lower, _NOT_FOUND_MARKERS):
         return PageInfo(final_url=final_url or url, title=title, page_kind="not_found")
+
+    if _looks_like_duckduckgo_results(host, path, query, title_lower, text_lower):
+        return PageInfo(final_url=final_url or url, title=title, page_kind="search_results")
 
     if _looks_like_job_board(path, title_lower, text_lower):
         return PageInfo(final_url=final_url or url, title=title, page_kind="job_board")
@@ -302,13 +312,14 @@ def extract_links(
     anchors = _select_anchors(soup, base_url, selector)
     base_host = _normalize_host(urlparse(base_url).netloc)
     github_user_search = _is_github_user_search(base_url)
+    preferred_domains = _preferred_profile_domains_for_search(base_url)
     ranked_links: list[tuple[int, str, str]] = []
 
     for anchor in anchors:
         href = anchor.get("href")
         if not isinstance(href, str):
             continue
-        normalized_url = _normalize_url(urljoin(base_url, href))
+        normalized_url = unwrap_discovery_redirect_url(urljoin(base_url, href), base_url=base_url)
         if not normalized_url:
             continue
 
@@ -319,6 +330,11 @@ def extract_links(
         text = anchor.get_text(separator=" ", strip=True)
         if github_user_search and not _is_github_profile_url(normalized_url):
             continue
+        if base_host in _DUCKDUCKGO_HOSTS:
+            if target_host in _DUCKDUCKGO_HOSTS:
+                continue
+            if preferred_domains and not any(_same_or_subdomain(target_host, domain) for domain in preferred_domains):
+                continue
         score = _score_link(anchor, normalized_url, text, base_url)
         if selector is None and score <= 0:
             continue
@@ -344,6 +360,29 @@ def _contains_marker(title_lower: str, text_lower: str, markers: tuple[str, ...]
     return any(marker in title_lower or marker in text_lower for marker in markers)
 
 
+def unwrap_discovery_redirect_url(url: str, base_url: str | None = None) -> str:
+    """Resolve known discovery-result wrapper URLs to their outbound targets."""
+    normalized = _normalize_url(urljoin(base_url, url) if base_url else url)
+    if not normalized:
+        return ""
+
+    parsed = urlparse(normalized)
+    host = _normalize_host(parsed.netloc)
+    if host not in _DUCKDUCKGO_HOSTS:
+        return normalized
+
+    query = parse_qs(parsed.query)
+    uddg_values = query.get("uddg") or query.get("rut")
+    if "uddg" in query and query["uddg"]:
+        decoded = _normalize_url(unquote(query["uddg"][0]))
+        return decoded or normalized
+
+    if parsed.path.lower() == "/l" and not uddg_values:
+        return normalized
+
+    return normalized
+
+
 def _looks_like_auth_wall(
     host: str,
     path: str,
@@ -361,6 +400,30 @@ def _looks_like_auth_wall(
     if host == "gitlab.com" and path.startswith("/users/sign_in"):
         return True
     return title_lower.startswith(("sign in", "log in", "login"))
+
+
+def _looks_like_duckduckgo_error_page(host: str, path: str, title_lower: str, text_lower: str) -> bool:
+    """Return True for DuckDuckGo anti-bot/error pages that should be treated as blocked."""
+    if host not in _DUCKDUCKGO_HOSTS:
+        return False
+    if path.startswith("/static-pages/418"):
+        return True
+    return "duckduckgo" in title_lower and ("error getting results" in text_lower or "418" in title_lower)
+
+
+def _looks_like_duckduckgo_results(
+    host: str,
+    path: str,
+    query: str,
+    title_lower: str,
+    text_lower: str,
+) -> bool:
+    """Return True for DuckDuckGo HTML search result pages before generic job-board matching."""
+    if host not in _DUCKDUCKGO_HOSTS:
+        return False
+    if path == "/html" and ("q=" in query or "search only" in text_lower):
+        return True
+    return "duckduckgo" in title_lower and "search results" in text_lower
 
 
 def _looks_like_job_board(path: str, title_lower: str, text_lower: str) -> bool:
@@ -493,6 +556,11 @@ def _select_anchors(soup: BeautifulSoup, base_url: str, selector: str | None):
         if specific:
             return specific
 
+    if host in _DUCKDUCKGO_HOSTS and path == "/html":
+        specific = soup.select("a.result__a[href], a[data-testid='result-title-a'][href]")
+        if specific:
+            return specific
+
     return soup.select("a[href]")
 
 
@@ -533,6 +601,8 @@ def _score_link(anchor, normalized_url: str, text: str, base_url: str) -> int:
 
     if host == "github.com" and len(path_segments) == 1 and path_segments[0] not in _GITHUB_RESERVED_SEGMENTS:
         score += 10
+    elif host in _DISCOVERY_PROFILE_DOMAINS:
+        score += 5
 
     if any(segment.lower() in _PROFILE_SEGMENTS for segment in path_segments):
         score += 7
@@ -561,11 +631,31 @@ def _score_link(anchor, normalized_url: str, text: str, base_url: str) -> int:
     return score
 
 
+def _preferred_profile_domains_for_search(base_url: str) -> set[str]:
+    """Infer which outbound profile domains a discovery/search page is expected to yield."""
+    parsed = urlparse(base_url)
+    host = _normalize_host(parsed.netloc)
+    if host not in _DUCKDUCKGO_HOSTS:
+        return set()
+
+    query = parse_qs(parsed.query).get("q", [""])[0].lower()
+    preferred: set[str] = set()
+    for match in re.findall(r"site:([a-z0-9.-]+)", query):
+        preferred.add(match.removeprefix("www."))
+    for domain in _DISCOVERY_PROFILE_DOMAINS:
+        if domain in query:
+            preferred.add(domain)
+    return preferred
+
+
 def _normalize_url(url: str) -> str:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return ""
-    normalized = parsed._replace(fragment="")
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    normalized = parsed._replace(path=path, fragment="")
     return urlunparse(normalized)
 
 

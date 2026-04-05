@@ -246,6 +246,46 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["page_kind"], "profile")
 
+    async def test_broad_mode_allows_discovered_follow_on_profile_domain(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 1,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+            scraper_browser=_FakeScraperBrowser(),
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"duckduckgo.com"}
+        ctx.candidate_domains = ["duckduckgo.com"]
+        ctx.fetch_metadata["fetch-ddg"] = {
+            "url": "https://duckduckgo.com/html/?q=site%3Agithub.com+engineer",
+            "final_url": "https://html.duckduckgo.com/html/?q=site%3Agithub.com+engineer",
+            "title": "search",
+            "page_kind": "search_results",
+            "preview": "results",
+        }
+        ctx.discovered_link_parents[_normalize_url("https://github.com/alice-smith")] = "fetch-ddg"
+
+        class _FakeFetchResult:
+            final_url = "https://github.com/alice-smith"
+            html = "<html><head><title>Alice Smith</title></head><body><h1>Alice Smith</h1></body></html>"
+
+        with patch("tools.registry.smart_fetch", return_value=_FakeFetchResult()):
+            result = await dispatch_tool(
+                "fetch_page",
+                {"url": "https://github.com/alice-smith", "needs_javascript": False},
+                ctx,
+            )
+
+        self.assertEqual(result["page_kind"], "profile")
+
     async def test_web_mode_rejects_social_media_urls(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
@@ -489,6 +529,31 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(normalized["job_title"], "Senior Staff Software Engineer (L7)")
         self.assertEqual(normalized["company"], "Google")
+
+    async def test_save_result_rejects_handle_only_name_without_strong_support(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "https://github.com", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        result = await dispatch_tool(
+            "save_result",
+            {
+                "url": "https://github.com/paulvalderama",
+                "data": {
+                    "name": "paulvalderama",
+                    "job_title": "Full-Stack Software Engineer building Javascript applications",
+                    "company": None,
+                    "social_media": "https://github.com/paulvalderama",
+                },
+            },
+            ctx,
+        )
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn("handle", result["reason"])
 
     def test_social_profile_urls_canonicalize_mini_profile_variants(self) -> None:
         self.assertEqual(

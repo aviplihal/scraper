@@ -25,7 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from human_emulator.platforms import adapter_for_url
 from human_emulator.social import RestrictionDetected, build_profile_html
 from source_state import SourceState, domain_for_platform, infer_source_family, infer_source_identity, source_key
-from tools.discovery import build_preview, classify_page, extract_links
+from tools.discovery import build_preview, classify_page, extract_links, unwrap_discovery_redirect_url
 from tools.fetcher import smart_fetch
 from tools.parser import parse_fields
 from tools.targeting import suggest_targets
@@ -179,6 +179,7 @@ class ToolContext:
     exhausted_discovery_fetches: set[str] = field(default_factory=set)
     exhausted_discovery_urls: set[str] = field(default_factory=set)
     fetch_parent_seeds: dict[str, str] = field(default_factory=dict)
+    discovered_link_parents: dict[str, str] = field(default_factory=dict)
     social_blank_seed_counts: dict[str, int] = field(default_factory=dict)
     social_platform_failures: dict[str, int] = field(default_factory=dict)
     social_platform_saves: dict[str, int] = field(default_factory=dict)
@@ -513,6 +514,7 @@ def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
 
 
 async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -> dict:
+    url = unwrap_discovery_redirect_url(url)
     logger.info("fetch_page: %s (js=%s)", url, needs_javascript)
     normalized_url = _normalize_url(url)
     domain = _domain_for_url(url)
@@ -846,7 +848,9 @@ def _tool_list_links(
 
     unseen_links = eligible_links[: max(1, min(int(limit), 50))]
     for item in unseen_links:
-        seen_urls.add(str(item.get("url", "")))
+        candidate_url = str(item.get("url", ""))
+        seen_urls.add(candidate_url)
+        ctx.discovered_link_parents[candidate_url] = fetch_id
 
     remaining_candidates = eligible_links[len(unseen_links) :]
     exhausted = len(eligible_links) < 2 or not remaining_candidates
@@ -1214,7 +1218,7 @@ def _broad_mode_rejection(url: str, normalized_url: str, domain: str, ctx: ToolC
             "Choose another candidate domain from suggest_targets."
         )
 
-    if domain not in ctx.allowed_domains:
+    if domain not in ctx.allowed_domains and not _allow_discovered_follow_on_url(normalized_url, domain, ctx):
         return (
             f"URL domain '{domain}' is outside the candidate domain pool for this run. "
             "Use the suggest_targets brief instead of inventing new domains."
@@ -1225,6 +1229,29 @@ def _broad_mode_rejection(url: str, normalized_url: str, domain: str, ctx: ToolC
         return denied_reason
 
     return None
+
+
+def _allow_discovered_follow_on_url(normalized_url: str, domain: str, ctx: ToolContext) -> bool:
+    """Allow profile/detail follow-on URLs discovered from an approved search page."""
+    parent_fetch_id = ctx.discovered_link_parents.get(normalized_url)
+    if not parent_fetch_id:
+        return False
+
+    metadata = ctx.fetch_metadata.get(parent_fetch_id, {})
+    parent_url = str(metadata.get("final_url") or metadata.get("url") or "")
+    parent_domain = _domain_for_url(parent_url)
+    parent_kind = str(metadata.get("page_kind", ""))
+
+    if not any(_same_or_subdomain(parent_domain, allowed_domain) for allowed_domain in ctx.allowed_domains):
+        return False
+    if parent_kind not in {"search_results", "directory", "company_directory", "company_page", "unknown"}:
+        return False
+    if domain in ctx.unavailable_domains or domain in ctx.avoid_domains:
+        return False
+    outcome = ctx.domain_outcomes.get(domain)
+    if outcome and outcome.banned_for_run:
+        return False
+    return True
 
 
 def _broad_mode_denied_url(url: str) -> str | None:
@@ -1691,6 +1718,51 @@ def _is_plausible_person_name(value: Any) -> bool:
     return any(char.isalpha() for char in name)
 
 
+def _looks_like_handle_name(value: Any) -> bool:
+    """Return True when a name is more likely a username than a real person name."""
+    if not isinstance(value, str):
+        return False
+    name = value.strip()
+    if not name:
+        return False
+    if any(char in name for char in "@/_."):
+        return True
+    if any(char.isdigit() for char in name):
+        return True
+    parts = name.split()
+    if len(parts) >= 2:
+        return False
+    token = parts[0] if parts else name
+    if token.lower() == token:
+        return True
+    return token.upper() == token and len(token) > 4
+
+
+def _has_strong_handle_support(data: dict[str, Any], source_url: str) -> bool:
+    """Require stronger evidence before accepting a handle-like name as a viable lead."""
+    job_title = str(data.get("job_title") or "").strip()
+    distinct_social = False
+    social_media = data.get("social_media")
+    if _has_meaningful_value(social_media):
+        distinct_social = _normalize_url(str(social_media)) != _normalize_url(source_url)
+
+    has_company = _has_meaningful_value(data.get("company"))
+    has_direct_contact = any(_has_meaningful_value(data.get(field)) for field in ("email", "phone"))
+    has_role = _looks_like_title_fragment(job_title)
+    senior_role = any(
+        term in job_title.lower()
+        for term in ("senior", "staff", "lead", "principal", "architect")
+    )
+
+    if has_company and has_role:
+        return True
+    if has_direct_contact and has_role:
+        return True
+    if distinct_social and senior_role:
+        return True
+    return False
+
+
 def _has_meaningful_value(value: Any) -> bool:
     """Return True when a field value is present enough to count as supporting lead data."""
     if value is None:
@@ -1937,8 +2009,11 @@ def _looks_like_social_profile_url(value: str) -> bool:
 
 def _is_minimally_viable_lead(data: dict[str, Any], source_url: str) -> tuple[bool, str]:
     """Return whether a lead is strong enough to count toward the run target."""
-    if not _is_plausible_person_name(data.get("name")):
+    name = data.get("name")
+    if not _is_plausible_person_name(name):
         return False, "missing a plausible person identifier in name"
+    if _looks_like_handle_name(name) and not _has_strong_handle_support(data, source_url):
+        return False, "name looks like a handle without enough supporting evidence"
 
     support_fields = ("job_title", "company", "email", "phone")
     if any(_has_meaningful_value(data.get(field)) for field in support_fields):
