@@ -1,9 +1,12 @@
 """Tests for registry guardrails and tool dispatch behavior."""
 
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from human_emulator.social import SocialFetchResult
+from source_state import SourceState
 from tools.registry import DomainOutcome, ToolContext, _record_domain_failure, _record_fetch_outcome, dispatch_tool
 
 
@@ -22,6 +25,20 @@ class _DummyWriter:
         self.saved_count += 1
         self.saved_rows.append({"url": url, "data": data})
         return "saved"
+
+    def recent_rows(self, limit: int = 20) -> list[dict]:
+        return [
+            {
+                "name": row["data"].get("name"),
+                "job_title": row["data"].get("job_title"),
+                "company": row["data"].get("company"),
+                "email": row["data"].get("email"),
+                "phone": row["data"].get("phone"),
+                "social_media": row["data"].get("social_media"),
+                "source_url": row["url"],
+            }
+            for row in self.saved_rows[:limit]
+        ]
 
 
 class _FakeEmulatorBrowser:
@@ -589,6 +606,130 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         _record_domain_failure("https://example.com/blog", "article or news page", ctx)
 
         self.assertTrue(ctx.domain_outcomes["example.com"].banned_for_run)
+
+    async def test_discovered_source_is_promoted_to_temporary_seed_at_balanced_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "website": "NA",
+                        "min_leads": 1,
+                        "source_accuracy": "balanced",
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "website": "NA",
+                        "min_leads": 1,
+                        "source_accuracy": "balanced",
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                        "job_title": "Senior Software Engineer",
+                        "job": "find engineers",
+                        "area": "NA",
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="discovery",
+                )
+                ctx.current_run_saved_leads.append(
+                    {
+                        "url": "https://github.com/alice",
+                        "data": {"name": "Alice Smith", "job_title": "Senior Software Engineer", "company": "Example"},
+                        "source_status": "approved",
+                    }
+                )
+
+                for idx in range(3):
+                    result = await dispatch_tool(
+                        "save_result",
+                        {
+                            "url": f"https://gitlab.com/user{idx}",
+                            "data": {
+                                "name": f"Engineer {idx}",
+                                "job_title": "Senior Software Engineer",
+                                "company": "Example Co",
+                            },
+                        },
+                        ctx,
+                    )
+
+                self.assertEqual(result["status"], "temporary_seed")
+                self.assertIn("gitlab.com", state.temporary_seed_sources()["web_domains"])
+                self.assertEqual(writer.saved_count, 3)
+            finally:
+                os.chdir(old_cwd)
+
+    async def test_discovered_source_is_queued_for_review_when_score_is_borderline(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "website": "NA",
+                        "min_leads": 1,
+                        "source_accuracy": "balanced",
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "website": "NA",
+                        "min_leads": 1,
+                        "source_accuracy": "balanced",
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                        "job_title": "Senior Software Engineer",
+                        "job": "find engineers",
+                        "area": "NA",
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="discovery",
+                )
+                ctx.current_run_saved_leads.append(
+                    {
+                        "url": "https://github.com/alice",
+                        "data": {
+                            "name": "Alice Smith",
+                            "job_title": "Senior Software Engineer",
+                            "company": "Example",
+                        },
+                        "source_status": "approved",
+                    }
+                )
+
+                for idx in range(3):
+                    result = await dispatch_tool(
+                        "save_result",
+                        {
+                            "url": f"https://gitlab.com/user{idx}",
+                            "data": {
+                                "name": f"Engineer {idx}",
+                                "job_title": "Engineer",
+                                "company": "Example Co",
+                            },
+                        },
+                        ctx,
+                    )
+
+                self.assertEqual(result["status"], "pending_review")
+                self.assertIn("gitlab.com", state.pending_review_sources()["web_domains"])
+                self.assertEqual(writer.saved_count, 0)
+            finally:
+                os.chdir(old_cwd)
 
 
 if __name__ == "__main__":

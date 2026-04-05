@@ -49,6 +49,35 @@ class RunJobValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported social platform"):
             _validate_config(config, "example_client")
 
+    def test_validate_config_seeds_approved_sources_from_legacy_fields(self) -> None:
+        config = {
+            "client_id": "example_client",
+            "min_leads": 1,
+            "website": "https://github.com",
+            "social_platforms": ["linkedin"],
+        }
+
+        _validate_config(config, "example_client")
+
+        self.assertEqual(
+            config["approved_sources"],
+            {
+                "web_domains": ["github.com"],
+                "social_platforms": ["linkedin"],
+            },
+        )
+        self.assertEqual(config["source_accuracy"], "balanced")
+
+    def test_validate_config_rejects_invalid_source_accuracy(self) -> None:
+        config = {
+            "client_id": "example_client",
+            "min_leads": 1,
+            "source_accuracy": "wild",
+        }
+
+        with self.assertRaisesRegex(ValueError, "source_accuracy"):
+            _validate_config(config, "example_client")
+
 
 if __name__ == "__main__":
     unittest.main()

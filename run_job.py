@@ -27,6 +27,7 @@ logging.basicConfig(
 
 from agent.runner import run_job  # noqa: E402 — import after dotenv
 from human_emulator.platforms import supported_social_platforms  # noqa: E402
+from source_state import SOURCE_ACCURACY_PRESETS, seed_approved_sources_from_config  # noqa: E402
 
 
 def _validate_config(config: dict, client_arg: str) -> None:
@@ -61,8 +62,36 @@ def _validate_config(config: dict, client_arg: str) -> None:
                 f"Unsupported social platform '{platform}'. Supported values are: {', '.join(sorted(supported))}."
             )
         normalized.append(normalized_name)
-    if normalized:
-        config["social_platforms"] = normalized
+    config["social_platforms"] = list(dict.fromkeys(normalized))
+
+    approved_sources = config.get("approved_sources")
+    if approved_sources is not None and not isinstance(approved_sources, dict):
+        raise ValueError("client config 'approved_sources' must be an object with 'web_domains' and 'social_platforms'.")
+
+    seeded_sources = seed_approved_sources_from_config(config)
+    normalized_approved = {
+        "web_domains": list(dict.fromkeys(seeded_sources["web_domains"])),
+        "social_platforms": list(dict.fromkeys(seeded_sources["social_platforms"])),
+    }
+    for platform in normalized_approved["social_platforms"]:
+        if platform not in supported:
+            raise ValueError(
+                f"Unsupported social platform '{platform}' in approved_sources. "
+                f"Supported values are: {', '.join(sorted(supported))}."
+            )
+    config["approved_sources"] = normalized_approved
+
+    combined_social = config["social_platforms"] + normalized_approved["social_platforms"]
+    config["social_platforms"] = list(dict.fromkeys(combined_social))
+
+    source_accuracy = str(config.get("source_accuracy", "balanced")).strip().lower() or "balanced"
+    if source_accuracy not in SOURCE_ACCURACY_PRESETS:
+        raise ValueError(
+            "client config 'source_accuracy' must be one of: "
+            + ", ".join(sorted(SOURCE_ACCURACY_PRESETS))
+            + "."
+        )
+    config["source_accuracy"] = source_accuracy
 
 
 def main() -> None:

@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 
 from human_emulator.platforms import adapter_for_url
 from human_emulator.social import RestrictionDetected
+from source_state import SourceState, domain_for_platform, infer_source_family, infer_source_identity, source_key
 from tools.discovery import build_preview, classify_page, extract_links
 from tools.fetcher import smart_fetch
 from tools.parser import parse_fields
@@ -82,6 +83,32 @@ class DomainOutcome:
     last_reason: str = ""
 
 
+@dataclass
+class SourceRunStats:
+    """Per-run counters for an individual source."""
+
+    kind: str
+    identifier: str
+    domain: str
+    family: str = ""
+    fetch_count: int = 0
+    saved_count: int = 0
+    duplicate_count: int = 0
+    rejected_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "identifier": self.identifier,
+            "domain": self.domain,
+            "family": self.family,
+            "fetch_count": self.fetch_count,
+            "saved_count": self.saved_count,
+            "duplicate_count": self.duplicate_count,
+            "rejected_count": self.rejected_count,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Tool context
 # ---------------------------------------------------------------------------
@@ -92,6 +119,7 @@ class ToolContext:
     client_config:  dict
     sheets_writer:  Any                              # storage.writer.StorageWriter
     source_mode:    str             = "web"
+    source_phase:   str             = "pass1"
     target_domain:  str | None      = None
     scraper_browser: Any | None      = None          # tools.browser.ScraperBrowser
     emulator_browser: Any | None     = None          # human_emulator.browser.EmulatorBrowser
@@ -122,6 +150,10 @@ class ToolContext:
     keyword_brief: dict[str, Any]      = field(default_factory=dict)
     source_mix: str | None             = None
     social_adapters: dict[str, Any]    = field(default_factory=dict)
+    source_state: SourceState | None   = None
+    source_run_stats: dict[str, SourceRunStats] = field(default_factory=dict)
+    discovery_source_samples: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    current_run_saved_leads: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +397,13 @@ async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> di
 
 def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
     """Return a keyword brief and candidate targets for the current run."""
-    result = suggest_targets(ctx.client_config, ctx.source_mode, limit=max(1, min(int(limit), 20)))
+    result = suggest_targets(
+        ctx.client_config,
+        ctx.source_mode,
+        limit=max(1, min(int(limit), 20)),
+        source_state=ctx.source_state,
+        phase=ctx.source_phase,
+    )
     targets = result.get("candidate_targets", [])
     ctx.suggest_targets_called = True
     ctx.suggested_targets = list(targets)
@@ -488,6 +526,7 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
     ctx.visited_urls.add(_normalize_url(page_info.final_url))
     ctx.visited_urls.add(normalized_url)
     _record_fetch_outcome(fetch_id, domain, page_info.page_kind, ctx)
+    _record_source_fetch(page_info.final_url, ctx)
 
     return {"fetch_id": fetch_id, **metadata}
 
@@ -576,6 +615,7 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
     ctx.visited_urls.add(_normalize_url(url))
     ctx.visited_urls.add(_normalize_url(fetch_result.final_url or url))
     _record_fetch_outcome(fetch_id, domain, fetch_result.page_kind, ctx)
+    _record_source_fetch(fetch_result.final_url or url, ctx)
 
     if fetch_result.page_kind == "profile":
         ctx.emulator_state.mark_visited(fetch_result.final_url or url, platform=platform)
@@ -661,19 +701,30 @@ def _tool_parse_html(
 
 
 async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
+    source_stats = _source_stats_for_url(url, ctx)
     viable, reason = _is_minimally_viable_lead(data, url)
     if not viable:
         ctx.rejected_weak_count += 1
+        source_stats.rejected_count += 1
         logger.info("Rejected weak lead: %s — %s", url, reason)
         print(f"  • Weak lead rejected: {data.get('name') or url} ({reason})", flush=True)
         return {"status": "rejected", "url": url, "reason": reason}
+
+    source_status = _source_status_for_url(url, ctx)
+    if ctx.source_state is not None and source_status == "discovered":
+        sample_result = await _sample_discovered_source(url, data, source_stats, ctx)
+        if sample_result is not None:
+            return sample_result
 
     try:
         status = await ctx.sheets_writer.append_row(url, data)
         if status == "saved":
             _record_domain_save(url, ctx)
+            source_stats.saved_count += 1
+            _record_saved_lead(url, data, source_status, source_stats.family, ctx)
             print(f"  ✓ Saved: {data.get('name') or url}", flush=True)
         else:
+            source_stats.duplicate_count += 1
             print(f"  • Duplicate skipped: {data.get('name') or url}", flush=True)
         return {"status": status, "url": url}
     except Exception as exc:
@@ -858,6 +909,286 @@ def _record_domain_save(url: str, ctx: ToolContext) -> None:
     outcome = _domain_outcome(ctx, domain)
     outcome.saved_hits += 1
     outcome.last_reason = "saved"
+
+
+def _source_stats_for_url(url: str, ctx: ToolContext) -> SourceRunStats:
+    """Return or initialize per-run stats for the source behind a URL."""
+    kind, identifier = infer_source_identity(url)
+    domain = _domain_for_url(url)
+    key = source_key(kind, identifier)
+    if key not in ctx.source_run_stats:
+        family = ""
+        if ctx.source_state is not None:
+            family = str(ctx.source_state.metadata_for(kind, identifier).get("family", ""))
+        if not family:
+            for target in ctx.suggested_targets:
+                target_kind = str(target.get("source_kind", ""))
+                target_id = str(target.get("source_id", ""))
+                if target_kind == kind and target_id == identifier:
+                    family = str(target.get("family", ""))
+                    break
+        if not family:
+            family = infer_source_family(kind, identifier)
+        ctx.source_run_stats[key] = SourceRunStats(
+            kind=kind,
+            identifier=identifier,
+            domain=domain,
+            family=family,
+        )
+    return ctx.source_run_stats[key]
+
+
+def _record_source_fetch(url: str, ctx: ToolContext) -> None:
+    """Increment fetch counts for the source behind a fetched URL."""
+    stats = _source_stats_for_url(url, ctx)
+    stats.fetch_count += 1
+
+
+def _source_status_for_url(url: str, ctx: ToolContext) -> str:
+    """Return the configured/persisted source status for a URL."""
+    if ctx.source_state is None:
+        return "approved"
+    kind, identifier = infer_source_identity(url)
+    return ctx.source_state.source_status(kind, identifier)
+
+
+def _record_saved_lead(
+    url: str,
+    data: dict[str, Any],
+    source_status: str,
+    source_family: str,
+    ctx: ToolContext,
+) -> None:
+    """Capture saved-lead metadata for baseline comparisons in this run."""
+    kind, identifier = infer_source_identity(url)
+    ctx.current_run_saved_leads.append(
+        {
+            "url": url,
+            "data": dict(data),
+            "source_status": source_status,
+            "source_kind": kind,
+            "source_identifier": identifier,
+            "source_family": source_family or infer_source_family(kind, identifier),
+        }
+    )
+
+
+async def _sample_discovered_source(
+    url: str,
+    data: dict[str, Any],
+    source_stats: SourceRunStats,
+    ctx: ToolContext,
+) -> dict[str, Any] | None:
+    """Hold newly discovered-source leads until the source is quality-gated."""
+    kind, identifier = infer_source_identity(url)
+    key = source_key(kind, identifier)
+    family = source_stats.family or infer_source_family(kind, identifier)
+    sample_bucket = ctx.discovery_source_samples.setdefault(key, [])
+    if any(existing["url"] == url for existing in sample_bucket):
+        return {"status": "sampled", "url": url, "sample_count": len(sample_bucket), "required_samples": 3}
+
+    sample_bucket.append({"url": url, "data": dict(data)})
+    if len(sample_bucket) < 3:
+        print(
+            f"  • Sampled discovered source lead {len(sample_bucket)}/3: {data.get('name') or url}",
+            flush=True,
+        )
+        return {"status": "sampled", "url": url, "sample_count": len(sample_bucket), "required_samples": 3}
+
+    baseline = _baseline_leads(ctx, limit=3)
+    source_score, lead_scores = _score_candidate_source(sample_bucket, source_stats, ctx)
+    baseline_score = _baseline_score(baseline, ctx)
+    outcome = _classify_candidate_source(source_score, baseline_score, ctx, exhausted=False)
+
+    if outcome == "approved":
+        ctx.source_state.promote_approved(kind, identifier, family, source_score)
+        await _flush_sampled_leads(sample_bucket, "approved", family, ctx)
+        ctx.discovery_source_samples.pop(key, None)
+        return {
+            "status": "approved_source",
+            "url": url,
+            "source": identifier,
+            "score": source_score,
+            "lead_scores": lead_scores,
+        }
+
+    if outcome == "temporary_seed":
+        ctx.source_state.promote_temporary_seed(kind, identifier, family, source_score)
+        await _flush_sampled_leads(sample_bucket, "temporary_seed", family, ctx)
+        ctx.discovery_source_samples.pop(key, None)
+        return {
+            "status": "temporary_seed",
+            "url": url,
+            "source": identifier,
+            "score": source_score,
+            "lead_scores": lead_scores,
+        }
+
+    if outcome == "pending_review":
+        ctx.source_state.queue_for_review(
+            kind,
+            identifier,
+            family,
+            source_score,
+            [item["data"] | {"source_url": item["url"]} for item in sample_bucket],
+            baseline,
+        )
+        ctx.discovery_source_samples.pop(key, None)
+        return {
+            "status": "pending_review",
+            "url": url,
+            "source": identifier,
+            "score": source_score,
+        }
+
+    ctx.source_state.reject_source(kind, identifier, family, source_score)
+    ctx.discovery_source_samples.pop(key, None)
+    return {
+        "status": "rejected_source",
+        "url": url,
+        "source": identifier,
+        "score": source_score,
+    }
+
+
+async def _flush_sampled_leads(
+    sample_bucket: list[dict[str, Any]],
+    source_status: str,
+    source_family: str,
+    ctx: ToolContext,
+) -> None:
+    """Persist sampled leads once a discovered source passes its quality gate."""
+    for item in sample_bucket:
+        url = item["url"]
+        data = item["data"]
+        source_stats = _source_stats_for_url(url, ctx)
+        status = await ctx.sheets_writer.append_row(url, data)
+        if status == "saved":
+            _record_domain_save(url, ctx)
+            source_stats.saved_count += 1
+            _record_saved_lead(url, data, source_status, source_family, ctx)
+            print(f"  ✓ Saved: {data.get('name') or url}", flush=True)
+        else:
+            source_stats.duplicate_count += 1
+            print(f"  • Duplicate skipped: {data.get('name') or url}", flush=True)
+
+
+def _accuracy_thresholds(ctx: ToolContext) -> dict[str, int]:
+    """Return the configured source-accuracy preset thresholds."""
+    preset = str(ctx.client_config.get("source_accuracy", "balanced")).strip().lower() or "balanced"
+    from source_state import SOURCE_ACCURACY_PRESETS
+
+    return SOURCE_ACCURACY_PRESETS[preset]
+
+
+def _baseline_leads(ctx: ToolContext, limit: int = 3) -> list[dict[str, Any]]:
+    """Collect approved-source leads from this run first, then from recent history."""
+    baseline = [
+        {"source_url": item["url"], **item["data"]}
+        for item in ctx.current_run_saved_leads
+        if item.get("source_status") == "approved"
+    ][:limit]
+    if len(baseline) >= limit:
+        return baseline
+
+    if ctx.source_state is None or not hasattr(ctx.sheets_writer, "recent_rows"):
+        return baseline
+
+    approved_sources = ctx.source_state.approved_sources()
+    approved_domains = set(approved_sources["web_domains"])
+    approved_social = {domain_for_platform(platform) for platform in approved_sources["social_platforms"]}
+    for row in ctx.sheets_writer.recent_rows(limit=20):
+        row_url = str(row.get("source_url", "")).strip()
+        domain = _domain_for_url(row_url)
+        if domain not in approved_domains and domain not in approved_social:
+            continue
+        baseline.append(dict(row))
+        if len(baseline) >= limit:
+            break
+    return baseline[:limit]
+
+
+def _lead_quality_score(data: dict[str, Any], ctx: ToolContext) -> int:
+    """Deterministically score a lead row from 0 to 100."""
+    score = 0
+    if _is_plausible_person_name(data.get("name")):
+        score += 15
+
+    job_title = str(data.get("job_title") or "").strip()
+    if job_title:
+        score += 15
+        title_lower = job_title.lower()
+        combined = " ".join(
+            str(value).lower()
+            for value in (
+                ctx.client_config.get("job_title", ""),
+                ctx.client_config.get("job", ""),
+            )
+        )
+        if any(token and token in title_lower for token in combined.split()):
+            score += 20
+        seniority_terms = ("founder", "cto", "chief", "head", "vp", "director", "principal", "staff", "senior")
+        if any(term in title_lower for term in seniority_terms):
+            score += 10
+
+    if _has_meaningful_value(data.get("company")):
+        score += 20
+    if _has_meaningful_value(data.get("email")):
+        score += 10
+    if _has_meaningful_value(data.get("phone")):
+        score += 5
+    if _has_meaningful_value(data.get("social_media")):
+        score += 10
+
+    location = str(data.get("location") or "").strip().lower()
+    area = str(ctx.client_config.get("area", "NA")).strip().lower()
+    if location and area not in {"", "na"} and area in location:
+        score += 10
+
+    return min(score, 100)
+
+
+def _score_candidate_source(
+    sample_bucket: list[dict[str, Any]],
+    source_stats: SourceRunStats,
+    ctx: ToolContext,
+) -> tuple[int, list[int]]:
+    """Score a candidate source based on lead quality and source-level penalties."""
+    lead_scores = [_lead_quality_score(item["data"], ctx) for item in sample_bucket[:3]]
+    average = int(round(sum(lead_scores) / max(1, len(lead_scores))))
+    penalty = min(20, source_stats.duplicate_count * 5 + source_stats.rejected_count * 8)
+    return max(0, average - penalty), lead_scores
+
+
+def _baseline_score(baseline_leads: list[dict[str, Any]], ctx: ToolContext) -> int:
+    """Compute the baseline approved-source score for comparison."""
+    if not baseline_leads:
+        return 0
+    scores = [_lead_quality_score(row, ctx) for row in baseline_leads[:3]]
+    return int(round(sum(scores) / max(1, len(scores))))
+
+
+def _classify_candidate_source(
+    candidate_score: int,
+    baseline_score: int,
+    ctx: ToolContext,
+    exhausted: bool,
+) -> str:
+    """Classify a candidate source into approved, temporary_seed, pending_review, or rejected."""
+    thresholds = _accuracy_thresholds(ctx)
+    gap = candidate_score - baseline_score if baseline_score else 0
+
+    if candidate_score >= thresholds["approved_threshold"] and gap >= thresholds["approved_gap"]:
+        return "approved"
+    if (
+        not exhausted
+        and candidate_score >= thresholds["temporary_seed_threshold"]
+        and gap >= thresholds["temporary_seed_gap"]
+    ):
+        return "temporary_seed"
+    if candidate_score >= thresholds["review_threshold"] and gap >= thresholds["review_gap"]:
+        return "pending_review"
+    return "rejected"
 
 
 def _curated_target_pool_exhausted(ctx: ToolContext) -> bool:

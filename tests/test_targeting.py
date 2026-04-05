@@ -1,7 +1,10 @@
 """Tests for curated broad-mode target selection."""
 
+import os
+import tempfile
 import unittest
 
+from source_state import SourceState
 from tools.targeting import suggest_targets
 
 
@@ -47,7 +50,8 @@ class TargetingTests(unittest.TestCase):
         self.assertTrue(any("x.com/search" in url for url in urls))
         first_wave_domains = [target["domain"] for target in result["candidate_targets"][:3]]
         self.assertEqual(len(first_wave_domains), len(set(first_wave_domains)))
-        self.assertIn(first_wave_domains[0], {"linkedin.com", "x.com"})
+        self.assertIn("github.com", first_wave_domains)
+        self.assertTrue(any(domain in {"linkedin.com", "x.com"} for domain in first_wave_domains))
 
     def test_human_emulator_mode_returns_social_targets_only(self) -> None:
         config = {
@@ -85,6 +89,62 @@ class TargetingTests(unittest.TestCase):
         self.assertEqual(result["strategy"], "pinned_site")
         for target in result["candidate_targets"]:
             self.assertTrue(str(target["url"]).startswith("https://github.com"))
+
+    def test_pass1_uses_only_approved_and_temporary_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                config = {
+                    "client_id": "example_client",
+                    "job": "find senior software engineers open to new opportunities",
+                    "job_title": "Senior Software Engineer",
+                    "area": "San Francisco Bay Area",
+                    "website": "NA",
+                    "min_leads": 3,
+                    "approved_sources": {"web_domains": ["github.com"], "social_platforms": ["linkedin"]},
+                    "social_platforms": ["linkedin", "x"],
+                }
+                state = SourceState("example_client", config)
+                state.promote_temporary_seed("web_domain", "gitlab.com", "developer_profiles", 82)
+
+                result = suggest_targets(config, "all", limit=6, source_state=state, phase="pass1")
+
+                domains = [target["domain"] for target in result["candidate_targets"]]
+                self.assertIn("github.com", domains)
+                self.assertIn("linkedin.com", domains)
+                self.assertIn("gitlab.com", domains)
+                self.assertNotIn("x.com", domains)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_discovery_excludes_approved_and_temporary_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                config = {
+                    "client_id": "example_client",
+                    "job": "find senior software engineers open to new opportunities",
+                    "job_title": "Senior Software Engineer",
+                    "area": "San Francisco Bay Area",
+                    "website": "NA",
+                    "min_leads": 3,
+                    "approved_sources": {"web_domains": ["github.com"], "social_platforms": ["linkedin"]},
+                    "social_platforms": ["linkedin", "x"],
+                }
+                state = SourceState("example_client", config)
+                state.promote_temporary_seed("web_domain", "gitlab.com", "developer_profiles", 82)
+
+                result = suggest_targets(config, "all", limit=6, source_state=state, phase="discovery")
+
+                domains = [target["domain"] for target in result["candidate_targets"]]
+                self.assertNotIn("github.com", domains)
+                self.assertNotIn("gitlab.com", domains)
+                self.assertNotIn("linkedin.com", domains)
+                self.assertIn("x.com", domains)
+            finally:
+                os.chdir(old_cwd)
 
 
 if __name__ == "__main__":

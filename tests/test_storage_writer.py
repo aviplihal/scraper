@@ -36,6 +36,29 @@ class StorageWriterTests(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_recent_rows_returns_latest_saved_lead(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = StorageWriter("client_a")
+                lead = {
+                    "name": "Alice Smith",
+                    "job_title": "Senior Software Engineer",
+                    "company": "Example Co",
+                    "email": None,
+                    "phone": None,
+                    "social_media": None,
+                }
+
+                asyncio.run(writer.append_row("https://example.com/alice", lead))
+                rows = writer.recent_rows(limit=1)
+
+                self.assertEqual(rows[0]["source_url"], "https://example.com/alice")
+                self.assertEqual(rows[0]["name"], "Alice Smith")
+            finally:
+                os.chdir(old_cwd)
+
 
 if __name__ == "__main__":
     unittest.main()

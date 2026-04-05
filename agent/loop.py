@@ -48,6 +48,7 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
     print(f"Model     : {MODEL}")
     print(f"Job       : {config['job']}")
     print(f"Lead target: {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads")
+    print(f"Source phase: {ctx.source_phase}")
     print(f"Max steps : {MAX_STEPS}\n")
 
     for step in range(1, MAX_STEPS + 1):
@@ -131,6 +132,9 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                         "Automatic profile processing completed but could not reach the lead target",
                     )
                 break
+
+            if _maybe_switch_to_discovery_phase(ctx, messages):
+                continue
 
             print(f"\n[agent] Agent finished after {step} step(s) — no further tool calls.")
             run_result["status"] = "completed"
@@ -280,8 +284,14 @@ def _build_follow_through_reminder(ctx: ToolContext) -> str:
             )
         return (
             f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
-            f"You already called suggest_targets. Choose 1 to 2 starter targets that best match the keyword brief for {primary_terms}. "
-            f"Suggested starter URLs: {preview}.{domain_switch_note}"
+            f"You already called suggest_targets for {ctx.source_phase}. Choose 1 to 2 starter targets that best match the keyword brief for {primary_terms}. "
+            f"Suggested starter URLs: {preview}."
+            + (
+                " If this is pass 2 discovery, sample up to 3 viable leads from any new source before going deeper."
+                if ctx.source_phase == "discovery"
+                else ""
+            )
+            + domain_switch_note
         )
 
     return (
@@ -419,6 +429,46 @@ def _under_target_stop_reason(ctx: ToolContext, prefix: str) -> str:
     )
 
 
+def _maybe_switch_to_discovery_phase(ctx: ToolContext, messages: list[dict]) -> bool:
+    """Move from approved/temp-source pass 1 into discovery pass 2 when pass 1 is exhausted."""
+    if ctx.source_phase != "pass1" or ctx.source_state is None:
+        return False
+    if _lead_target_reached(ctx):
+        return False
+    pass1_exhausted = _curated_target_pool_exhausted(ctx)
+    if ctx.suggest_targets_called and not (ctx.candidate_domains or ctx.allowed_domains):
+        pass1_exhausted = True
+    if not pass1_exhausted:
+        return False
+
+    ctx.source_phase = "discovery"
+    ctx.suggest_targets_called = False
+    ctx.suggested_targets.clear()
+    ctx.suggested_target_urls.clear()
+    ctx.allowed_domains.clear()
+    ctx.candidate_domains.clear()
+    ctx.avoid_domains.clear()
+    ctx.keyword_brief.clear()
+    ctx.target_strategy = None
+    ctx.source_mix = None
+    print(
+        "[agent] Pass 1 approved and temporary seed sources are exhausted. Switching to pass 2 discovery.",
+        flush=True,
+    )
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Pass 1 is exhausted and the lead target is still unmet. "
+                "Start pass 2 now: call suggest_targets again, stay close to the approved source families, "
+                "sample up to 3 viable leads from any new source before deeper scraping, and keep going until "
+                "you reach the lead target or useful work is exhausted."
+            ),
+        }
+    )
+    return True
+
+
 def _needs_target_suggestions(ctx: ToolContext) -> bool:
     """Return True when a website=NA run has not yet requested curated targets."""
     return (
@@ -446,6 +496,9 @@ def _needs_target_fetch_follow_through(ctx: ToolContext) -> bool:
 
 def _print_targeting_brief(result: dict) -> None:
     """Print a concise targeting brief after suggest_targets runs."""
+    phase = str(result.get("phase", "")).strip()
+    if phase:
+        print(f"[agent] Source phase: {phase}", flush=True)
     strategy = str(result.get("strategy", "")).strip()
     if strategy:
         print(f"[agent] Target strategy: {strategy}", flush=True)

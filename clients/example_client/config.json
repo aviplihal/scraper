@@ -5,6 +5,11 @@
   "area": "San Francisco Bay Area",
   "website": "NA",
   "min_leads": 3,
+  "source_accuracy": "balanced",
+  "approved_sources": {
+    "web_domains": ["github.com"],
+    "social_platforms": ["linkedin", "x"]
+  },
   "social_platforms": ["linkedin", "x"],
   "sources": ["web", "human_emulator"],
   "fields": {

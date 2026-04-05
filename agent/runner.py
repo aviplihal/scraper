@@ -11,6 +11,7 @@ from agent.loop import run_agent_loop
 from human_emulator.browser import EmulatorBrowser
 from human_emulator.platforms import adapter_for_platform
 from human_emulator.state import EmulatorState
+from source_state import SourceState
 from storage.writer import StorageWriter
 # To switch back to Google Sheets, replace the line above with:
 #   from sheets.writer import SheetsWriter
@@ -48,6 +49,8 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
         await emulator_browser.start()
         emulator_state = EmulatorState(client_id, _social_platforms_for_config(config))
 
+    source_state = SourceState(client_id, config)
+
     ctx = ToolContext(
         client_config    = config,
         sheets_writer    = writer,
@@ -56,6 +59,8 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
         scraper_browser  = scraper,
         emulator_browser = emulator_browser,
         emulator_state   = emulator_state,
+        source_state     = source_state,
+        source_phase     = "pass1" if source_state.has_pass1_sources_for_mode(source) else "discovery",
     )
 
     try:
@@ -66,6 +71,12 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
         await scraper.close()
         if emulator_browser:
             await emulator_browser.close()
+
+    if ctx.source_state is not None:
+        ctx.source_state.finalize_run({
+            source_key: stats.to_dict()
+            for source_key, stats in ctx.source_run_stats.items()
+        })
 
     _print_run_summary(config, source, writer, ctx, run_result)
 
@@ -78,6 +89,8 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
     await emulator_browser.start()
     emulator_state   = EmulatorState(client_id, platforms)
 
+    source_state = SourceState(client_id, config)
+
     ctx = ToolContext(
         client_config    = config,
         sheets_writer    = writer,
@@ -85,6 +98,8 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
         target_domain    = _target_domain_for_config(config),
         emulator_browser = emulator_browser,
         emulator_state   = emulator_state,
+        source_state     = source_state,
+        source_phase     = "pass1" if source_state.has_pass1_sources_for_mode("human_emulator") else "discovery",
     )
 
     try:
@@ -106,6 +121,12 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
         run_result = await run_agent_loop(config, "human_emulator", ctx)
     finally:
         await emulator_browser.close()
+
+    if ctx.source_state is not None:
+        ctx.source_state.finalize_run({
+            source_key: stats.to_dict()
+            for source_key, stats in ctx.source_run_stats.items()
+        })
 
     _print_run_summary(config, "human_emulator", writer, ctx, run_result)
 
@@ -138,6 +159,17 @@ def _print_run_summary(
     print(f"Target reached: {'yes' if target_reached else 'no'}")
     print(f"Failed URLs: {len(ctx.failed_urls)}")
     print(f"Why stop   : {run_result['stop_reason']}")
+
+    if ctx.source_state is not None:
+        approved = ctx.source_state.approved_sources()
+        temporary = ctx.source_state.temporary_seed_sources()
+        pending = ctx.source_state.pending_review_sources()
+        print(
+            "Source pools: "
+            f"approved={len(approved['web_domains']) + len(approved['social_platforms'])}, "
+            f"temporary={len(temporary['web_domains']) + len(temporary['social_platforms'])}, "
+            f"pending_review={len(pending['web_domains']) + len(pending['social_platforms'])}"
+        )
 
     social_platforms = _social_platforms_for_config(config)
     if social_platforms and ctx.emulator_state is not None:

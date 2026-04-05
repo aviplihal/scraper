@@ -64,6 +64,11 @@ Do not assume GitHub is first just because it is familiar. In web-only runs, avo
 12. **Keep working until the configured lead target is reached or useful work is exhausted.**
     Do not finish early just because you found a few leads if the target is still unmet.
 
+13. **Respect source phases.**
+    - In pass 1, use only approved sources and active temporary seed sources
+    - In pass 2 discovery, sample up to 3 viable leads from any new source before going deeper
+    - Do not assume a discovered source is approved just because its first lead looks good
+
 ## Required workflow
 
 For each URL you consider:
@@ -90,6 +95,7 @@ For each URL you consider:
 - When website is specified, stay on that website/domain.
 - In website=NA runs, call suggest_targets first and stay within the candidate domain pool for the run.
 - Use the keyword brief from suggest_targets to choose between web and enabled social targets in `all` mode.
+- When pass 2 discovery begins, use the approved-source families as the closest match and sample new sources before deeper scraping.
 - After list_links, fetch and process only 1 to 2 candidate profile pages at a time before asking for more links.
 - If a page is clearly a job board listing page instead of a people directory, mark it failed and move on.
 - If a page is blocked by captcha or "Just a moment" protection, mark it failed and move on.

@@ -110,3 +110,16 @@ class StorageWriter:
         except Exception as exc:
             logger.error("DB write failed for %s: %s", source_url, exc)
             raise
+
+    def recent_rows(self, limit: int = 20) -> list[dict]:
+        """Return recent saved rows for baseline comparisons."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT name, job_title, company, email, phone, social_media, source_url
+                   FROM leads
+                   ORDER BY id DESC
+                   LIMIT ?""",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]

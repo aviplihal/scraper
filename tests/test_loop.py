@@ -1,15 +1,19 @@
 """Tests for agent loop stop and fallback behavior."""
 
 import unittest
+import os
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.loop import (
     _auto_fail_remaining_non_actionable_pages,
     _build_follow_through_reminder,
+    _maybe_switch_to_discovery_phase,
     _try_automatic_profile_processing,
     run_agent_loop,
 )
+from source_state import SourceState
 from tools.registry import ToolContext
 
 
@@ -249,6 +253,81 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
         reminder = _build_follow_through_reminder(ctx)
 
         self.assertIn("Prefer a different domain/source now because github.com has not produced a viable lead yet", reminder)
+
+    def test_follow_through_reminder_mentions_discovery_sampling(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "NA",
+                "website": "NA",
+                "min_leads": 3,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+            source_phase="discovery",
+        )
+        ctx.suggest_targets_called = True
+        ctx.keyword_brief = {"primary_terms": ["Senior Software Engineer"]}
+        ctx.suggested_targets = [{"url": "https://gitlab.com/explore/users?search=Engineer", "domain": "gitlab.com"}]
+        ctx.allowed_domains = {"gitlab.com"}
+        ctx.candidate_domains = ["gitlab.com"]
+
+        reminder = _build_follow_through_reminder(ctx)
+
+        self.assertIn("sample up to 3 viable leads", reminder)
+
+    def test_switch_to_discovery_phase_when_pass1_pool_is_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="pass1",
+                )
+                ctx.suggest_targets_called = True
+                ctx.allowed_domains = {"github.com"}
+                ctx.candidate_domains = ["github.com"]
+                ctx.domain_outcomes["github.com"] = SimpleNamespace(
+                    blocked_count=0,
+                    irrelevant_count=2,
+                    discovery_hits=0,
+                    profile_hits=0,
+                    saved_hits=0,
+                    banned_for_run=True,
+                    last_reason="job_board",
+                )
+
+                messages: list[dict] = []
+                switched = _maybe_switch_to_discovery_phase(ctx, messages)
+
+                self.assertTrue(switched)
+                self.assertEqual(ctx.source_phase, "discovery")
+                self.assertFalse(ctx.suggest_targets_called)
+                self.assertIn("Pass 1 is exhausted", messages[0]["content"])
+            finally:
+                os.chdir(old_cwd)
 
     async def test_auto_fail_remaining_non_actionable_pages_marks_pages_processed(self) -> None:
         writer = _DummyWriter()

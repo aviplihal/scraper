@@ -5,6 +5,11 @@
   "area": "San Francisco Bay Area",
   "website": "https://github.com",
   "min_leads": 3,
+  "source_accuracy": "balanced",
+  "approved_sources": {
+    "web_domains": ["github.com"],
+    "social_platforms": []
+  },
   "sources": ["web"],
   "fields": {
     "name": "Full name of the person",
