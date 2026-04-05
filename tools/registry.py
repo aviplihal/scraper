@@ -152,6 +152,7 @@ class ToolContext:
     visited_urls:    set[str]        = field(default_factory=set)
     processed_fetch_ids: set[str]    = field(default_factory=set)
     domain_fetch_counts: dict[str, int] = field(default_factory=dict)
+    fetch_budget_counts: dict[str, int] = field(default_factory=dict)
     parsed_results:  dict[str, dict[str, Any]] = field(default_factory=dict)
     rejected_weak_count: int           = 0
     domain_outcomes: dict[str, DomainOutcome] = field(default_factory=dict)
@@ -518,6 +519,7 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
     logger.info("fetch_page: %s (js=%s)", url, needs_javascript)
     normalized_url = _normalize_url(url)
     domain = _domain_for_url(url)
+    budget_key = _fetch_budget_key(url)
 
     if _already_saved_source_url(url, ctx):
         _mark_terminal_url(url, "duplicate", ctx)
@@ -607,7 +609,7 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
         }
 
     fetch_budget = _fetch_budget_for_url(url, ctx)
-    if ctx.domain_fetch_counts.get(domain, 0) >= fetch_budget:
+    if ctx.fetch_budget_counts.get(budget_key, 0) >= fetch_budget:
         ctx.fetch_error_count += 1
         return {
             "error": f"Fetch budget reached for domain '{domain}' in this run.",
@@ -644,6 +646,7 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
     async with ctx.state_lock:
         ctx.fetch_count += 1
         ctx.domain_fetch_counts[domain] = ctx.domain_fetch_counts.get(domain, 0) + 1
+        ctx.fetch_budget_counts[budget_key] = ctx.fetch_budget_counts.get(budget_key, 0) + 1
         ctx.page_cache[fetch_id] = fetch_result.html
         ctx.fetch_metadata[fetch_id] = metadata
         ctx.url_to_fetch_id[normalized_url] = fetch_id
@@ -728,6 +731,7 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
         }
 
     domain = _domain_for_url(fetch_result.final_url or url)
+    budget_key = _fetch_budget_key(fetch_result.final_url or url)
     fetch_id = str(uuid.uuid4())
     preview = build_preview(fetch_result.html)
     metadata = {
@@ -742,6 +746,7 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
     async with ctx.state_lock:
         ctx.fetch_count += 1
         ctx.domain_fetch_counts[domain] = ctx.domain_fetch_counts.get(domain, 0) + 1
+        ctx.fetch_budget_counts[budget_key] = ctx.fetch_budget_counts.get(budget_key, 0) + 1
         ctx.page_cache[fetch_id] = fetch_result.html
         ctx.fetch_metadata[fetch_id] = metadata
         ctx.url_to_fetch_id[_normalize_url(url)] = fetch_id
@@ -900,6 +905,20 @@ def _tool_parse_html(
 
 
 async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
+    prior_outcome = _terminal_outcome_for_url(url, ctx)
+    if prior_outcome == "saved":
+        duplicate_count = getattr(ctx.sheets_writer, "duplicate_count", None)
+        if isinstance(duplicate_count, int):
+            ctx.sheets_writer.duplicate_count = duplicate_count + 1
+        return {"status": "duplicate", "url": url}
+    if prior_outcome == "duplicate":
+        duplicate_count = getattr(ctx.sheets_writer, "duplicate_count", None)
+        if isinstance(duplicate_count, int):
+            ctx.sheets_writer.duplicate_count = duplicate_count + 1
+        return {"status": "duplicate", "url": url}
+    if prior_outcome == "rejected":
+        return {"status": "rejected", "url": url, "reason": "Previously rejected earlier in this run."}
+
     data = _normalize_lead_payload(url, data)
     source_stats = _source_stats_for_url(url, ctx)
     viable, reason = _is_minimally_viable_lead(data, url)
@@ -1106,21 +1125,42 @@ def _saved_count(ctx: ToolContext) -> int:
 
 def _fetch_budget_for_url(url: str, ctx: ToolContext) -> int:
     """Return the per-run fetch budget for a URL based on domain and run size."""
-    domain = _domain_for_url(url)
+    budget_key = _fetch_budget_key(url)
     min_leads = max(1, int(ctx.client_config.get("min_leads", 3) or 3))
+    if budget_key == "github.com:search":
+        return max(12, min_leads * 2)
+    if budget_key == "github.com:profile":
+        return max(24, min_leads * 6)
+    if budget_key == "duckduckgo.com:search":
+        return max(6, min(12, min_leads))
+    if budget_key in {"linkedin.com:social", "x.com:social", "twitter.com:social"}:
+        return max(6, min_leads * 2)
+    domain = _domain_for_url(url)
+    return _MAX_FETCHES_PER_DOMAIN
+
+
+def _fetch_budget_key(url: str) -> str:
+    """Return the budget bucket for a URL so search and profile budgets stay separate."""
+    domain = _domain_for_url(url)
     parsed = urlparse(url if "://" in url else f"https://{url}")
     path = parsed.path.lower()
     query = parsed.query.lower()
 
     if domain == "github.com":
         if path == "/search" and "type=users" in query:
-            return max(12, min_leads * 3)
-        return max(24, min_leads * 6)
+            return "github.com:search"
+        return "github.com:profile"
     if domain == "duckduckgo.com":
-        return max(6, min(12, min_leads))
+        return "duckduckgo.com:search"
     if domain in {"linkedin.com", "x.com", "twitter.com"}:
-        return max(6, min_leads * 2)
-    return _MAX_FETCHES_PER_DOMAIN
+        return f"{domain}:social"
+    return domain
+
+
+def _url_budget_exhausted(url: str, ctx: ToolContext) -> bool:
+    """Return True when the URL's fetch bucket is exhausted for the current run."""
+    budget_key = _fetch_budget_key(url)
+    return ctx.fetch_budget_counts.get(budget_key, 0) >= _fetch_budget_for_url(url, ctx)
 
 
 def _has_alternative_allowed_domain(url: str, ctx: ToolContext) -> bool:
@@ -1147,6 +1187,8 @@ def _filter_candidate_targets(targets: list[dict[str, Any]], ctx: ToolContext) -
         url = str(target.get("url", "")).strip()
         domain = str(target.get("domain", "")).strip().lower() or _domain_for_url(url)
         if not url or not domain:
+            continue
+        if _url_budget_exhausted(url, ctx):
             continue
         if domain in ctx.unavailable_domains:
             continue
@@ -1722,6 +1764,8 @@ def _has_remaining_target_urls(ctx: ToolContext) -> bool:
         normalized_url = _normalize_url(url)
         domain = _domain_for_url(url)
         if domain in ctx.unavailable_domains:
+            continue
+        if _url_budget_exhausted(url, ctx):
             continue
         if _terminal_outcome_for_url(url, ctx):
             continue

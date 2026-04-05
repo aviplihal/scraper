@@ -300,6 +300,39 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["page_kind"], "profile")
 
+    async def test_github_search_budget_exhaustion_does_not_block_profile_fetches(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 10,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+            scraper_browser=_FakeScraperBrowser(),
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"github.com"}
+        ctx.candidate_domains = ["github.com"]
+        ctx.fetch_budget_counts["github.com:search"] = 20
+
+        class _FakeFetchResult:
+            final_url = "https://github.com/alice-smith"
+            html = "<html><head><title>Alice Smith</title></head><body><h1>Alice Smith</h1></body></html>"
+
+        with patch("tools.registry.smart_fetch", return_value=_FakeFetchResult()):
+            result = await dispatch_tool(
+                "fetch_page",
+                {"url": "https://github.com/alice-smith", "needs_javascript": False},
+                ctx,
+            )
+
+        self.assertEqual(result["page_kind"], "profile")
+
     async def test_broad_mode_allows_discovered_follow_on_profile_domain(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(

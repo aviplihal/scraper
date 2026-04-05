@@ -20,6 +20,8 @@ from tools.registry import (
     ToolContext,
     _curated_target_pool_exhausted,
     _domain_for_url,
+    _fetch_budget_for_url,
+    _fetch_budget_key,
     _normalize_url,
     dispatch_tool,
 )
@@ -32,7 +34,7 @@ _PROMPT_TOKEN_COMPACT_THRESHOLD = 2500
 _MESSAGE_COMPACT_THRESHOLD = 12
 _MESSAGE_COMPACT_HARD_THRESHOLD = 22
 _COMPACTION_MIN_NEW_MESSAGES = 10
-_AUTO_PROFILE_BATCH_SIZE = 2
+_AUTO_PROFILE_BATCH_SIZE = 3
 _FAKE_TOOL_CALL_PATTERN = re.compile(r"\b(fetch_page|fetch_url|list_links|parse_html|save_result|fail_url|suggest_targets)\s*\(")
 _RECOVERABLE_MODEL_ERROR_PATTERNS = (
     "xml syntax error",
@@ -50,7 +52,7 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
 
     client = ollama.AsyncClient()
     follow_through_reminders = 0
-    last_follow_through_signature: tuple[int, int, int, int, str] | None = None
+    last_follow_through_signature: tuple[int, int, int, int, int, str] | None = None
     run_result = {
         "steps_run": 0,
         "status": "unknown",
@@ -165,6 +167,15 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
             if _maybe_switch_to_discovery_phase(ctx, messages):
                 continue
 
+            if _no_viable_next_actions(ctx):
+                print(f"\n[agent] Agent finished after {step} step(s) — no viable next actions remained.")
+                run_result["status"] = "completed"
+                run_result["stop_reason"] = _under_target_stop_reason(
+                    ctx,
+                    "No actionable pages or fetchable candidate targets remained",
+                )
+                break
+
             print(f"\n[agent] Agent finished after {step} step(s) — no further tool calls.")
             run_result["status"] = "completed"
             run_result["stop_reason"] = (
@@ -239,6 +250,24 @@ async def _execute_tool_calls(
             results = [await _run_single_tool_call(step, batch[0], ctx)]
 
         for tool_name, result in results:
+            if tool_name == "finish_run":
+                run_result["status"] = "completed"
+                reason = str(result.get("reason") or "").strip()
+                run_result["stop_reason"] = (
+                    reason
+                    if reason
+                    else (
+                        _lead_target_stop_reason(ctx)
+                        if _lead_target_reached(ctx)
+                        else _under_target_stop_reason(ctx, "Agent requested an early finish")
+                    )
+                )
+                print(
+                    f"\n[agent] Agent finished after step {step} — requested early completion.",
+                    flush=True,
+                )
+                return True
+
             if tool_name == "suggest_targets" and "error" not in result:
                 _print_targeting_brief(result)
 
@@ -289,6 +318,16 @@ async def _run_single_tool_call(step: int, tool_call, ctx: ToolContext) -> tuple
     tool_name = _normalized_tool_name(tool_call.function.name)
     arguments = _tool_arguments(tool_call)
 
+    if tool_name == "finish_run":
+        result = {
+            "status": "finish_requested",
+            "reason": str(arguments.get("reason") or "").strip(),
+        }
+        print(f"[step {step}] → {tool_name}({_fmt_args(arguments)})", flush=True)
+        result_str = json.dumps(result, ensure_ascii=False)
+        print(f"[step {step}] ← {result_str[:300]}", flush=True)
+        return tool_name, result
+
     print(f"[step {step}] → {tool_name}({_fmt_args(arguments)})", flush=True)
     result = await dispatch_tool(tool_name, arguments, ctx)
     result_str = json.dumps(result, ensure_ascii=False)
@@ -298,7 +337,9 @@ async def _run_single_tool_call(step: int, tool_call, ctx: ToolContext) -> tuple
 
 def _normalized_tool_name(tool_name: str) -> str:
     """Normalize model-emitted tool names to the supported registry names."""
-    return "fetch_page" if tool_name == "fetch_url" else tool_name
+    if tool_name == "fetch_url":
+        return "fetch_page"
+    return tool_name
 
 
 def _tool_arguments(tool_call) -> dict:
@@ -556,6 +597,7 @@ def _should_request_follow_through(ctx: ToolContext) -> bool:
     return (
         _needs_target_suggestions(ctx)
         or _needs_target_fetch_follow_through(ctx)
+        or bool(_remaining_discovered_profile_urls(ctx))
         or bool(_remaining_discovery_fetch_ids(ctx))
         or bool(_unprocessed_fetch_ids(ctx))
     )
@@ -609,6 +651,16 @@ def _build_follow_through_reminder(ctx: ToolContext) -> str:
             f"Outstanding pages: {summary}"
         )
 
+    discovered_profile_urls = _remaining_discovered_profile_urls(ctx)
+    if discovered_profile_urls:
+        preview = " ".join(discovered_profile_urls[:5])
+        fetch_count = min(5, max(2, _lead_target(ctx) - _saved_lead_count(ctx)))
+        return (
+            f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
+            "Fetch the discovered profile/detail URLs from the current search pages before asking for new targets. "
+            f"Fetch up to {fetch_count} of these next: {preview}"
+        )
+
     if _remaining_discovery_fetch_ids(ctx):
         discovery_pages = []
         for fetch_id in _remaining_discovery_fetch_ids(ctx)[:2]:
@@ -626,6 +678,11 @@ def _build_follow_through_reminder(ctx: ToolContext) -> str:
 
     if _needs_target_fetch_follow_through(ctx):
         preview = " ".join(_candidate_preview_urls(ctx, limit=3))
+        if not preview:
+            return (
+                f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
+                "No fetchable starter URLs remain in the current phase. Stop if no other actionable pages remain."
+            )
         keyword_brief = ctx.keyword_brief or {}
         primary_terms = ", ".join(keyword_brief.get("primary_terms", [])) or "the target persona"
         domain_switch_note = ""
@@ -666,7 +723,7 @@ async def _try_automatic_profile_processing(ctx: ToolContext, messages: list[dic
     processed_any = False
 
     remaining_gap = max(1, _lead_target(ctx) - _saved_lead_count(ctx))
-    batch_size = min(len(profile_fetch_ids), max(_AUTO_PROFILE_BATCH_SIZE, min(4, remaining_gap)))
+    batch_size = min(len(profile_fetch_ids), max(_AUTO_PROFILE_BATCH_SIZE, min(6, remaining_gap)))
     batch = profile_fetch_ids[:batch_size]
     parse_records = await asyncio.gather(
         *[_auto_process_profile_fetch(step, fetch_id, ctx) for fetch_id in batch]
@@ -924,6 +981,8 @@ def _remaining_candidate_domains(ctx: ToolContext) -> list[str]:
             continue
         if _domain_on_low_yield_cooldown(domain, ctx):
             continue
+        if _domain_budget_exhausted(domain, ctx):
+            continue
         if domain not in fetched_domains:
             remaining.append(domain)
     return remaining
@@ -944,6 +1003,7 @@ def _remaining_candidate_target_urls(ctx: ToolContext) -> list[str]:
         if (
             normalized_url in seen
             or domain in getattr(ctx, "unavailable_domains", set())
+            or _url_budget_exhausted(url, ctx)
             or normalized_url in getattr(ctx, "exhausted_discovery_urls", set())
             or normalized_url in getattr(ctx, "url_to_fetch_id", {})
             or normalized_url in getattr(ctx, "terminal_url_outcomes", {})
@@ -964,6 +1024,27 @@ def _remaining_discovery_fetch_ids(ctx: ToolContext) -> list[str]:
             continue
         remaining.append(fetch_id)
     return remaining
+
+
+def _remaining_discovered_profile_urls(ctx: ToolContext) -> list[str]:
+    """Return discovered profile/detail URLs that are ready to fetch next."""
+    ready: list[str] = []
+    for normalized_url, parent_fetch_id in ctx.discovered_link_parents.items():
+        if parent_fetch_id not in ctx.fetch_metadata:
+            continue
+        metadata = ctx.fetch_metadata.get(parent_fetch_id, {})
+        if metadata.get("page_kind") not in {"search_results", "directory", "company_directory", "company_page", "unknown"}:
+            continue
+        if normalized_url in ctx.visited_urls or normalized_url in getattr(ctx, "terminal_url_outcomes", {}):
+            continue
+        if normalized_url in getattr(ctx, "url_to_fetch_id", {}):
+            continue
+        if normalized_url in getattr(ctx, "exhausted_discovery_urls", set()):
+            continue
+        if _url_budget_exhausted(normalized_url, ctx):
+            continue
+        ready.append(normalized_url)
+    return ready
 
 
 def _domain_on_low_yield_cooldown(domain: str, ctx: ToolContext) -> bool:
@@ -994,6 +1075,7 @@ def _candidate_preview_urls(ctx: ToolContext, limit: int = 3) -> list[str]:
                     or url in preview_urls
                     or url not in remaining_target_url_set
                     or _domain_for_url(url) in getattr(ctx, "unavailable_domains", set())
+                    or _url_budget_exhausted(url, ctx)
                     or _normalize_url(url) in getattr(ctx, "exhausted_discovery_urls", set())
                 ):
                     continue
@@ -1009,6 +1091,7 @@ def _candidate_preview_urls(ctx: ToolContext, limit: int = 3) -> list[str]:
             or url in preview_urls
             or (remaining_target_url_set and url not in remaining_target_url_set)
             or _domain_for_url(url) in getattr(ctx, "unavailable_domains", set())
+            or _url_budget_exhausted(url, ctx)
             or _normalize_url(url) in getattr(ctx, "exhausted_discovery_urls", set())
         ):
             continue
@@ -1042,12 +1125,42 @@ def _switch_candidate_domain(ctx: ToolContext) -> str | None:
     return last_domain
 
 
-def _follow_through_signature(ctx: ToolContext) -> tuple[int, int, int, int, str]:
+def _follow_through_signature(ctx: ToolContext) -> tuple[int, int, int, int, int, str]:
     """Return a lightweight snapshot of actionable state for reminder budgeting."""
     return (
         len(_unprocessed_fetch_ids(ctx)),
         len(_remaining_discovery_fetch_ids(ctx)),
+        len(_remaining_discovered_profile_urls(ctx)),
         len(_remaining_candidate_target_urls(ctx)) + len(_remaining_candidate_domains(ctx)),
         _saved_lead_count(ctx),
         ctx.source_phase,
+    )
+
+
+def _url_budget_exhausted(url: str, ctx: ToolContext) -> bool:
+    """Return True when the URL's fetch budget bucket is exhausted."""
+    budget_key = _fetch_budget_key(url)
+    return ctx.fetch_budget_counts.get(budget_key, 0) >= _fetch_budget_for_url(url, ctx)
+
+
+def _domain_budget_exhausted(domain: str, ctx: ToolContext) -> bool:
+    """Return True when all suggested starter URLs for a domain are out of budget."""
+    candidate_urls = [
+        str(target.get("url", "")).strip()
+        for target in ctx.suggested_targets
+        if str(target.get("domain", "")).strip().lower() == domain and str(target.get("url", "")).strip()
+    ]
+    if not candidate_urls:
+        return False
+    return all(_url_budget_exhausted(url, ctx) for url in candidate_urls)
+
+
+def _no_viable_next_actions(ctx: ToolContext) -> bool:
+    """Return True when the run has no actionable fetched pages or fetchable next URLs left."""
+    return not (
+        _unprocessed_fetch_ids(ctx)
+        or _remaining_discovery_fetch_ids(ctx)
+        or _remaining_discovered_profile_urls(ctx)
+        or _remaining_candidate_target_urls(ctx)
+        or _remaining_candidate_domains(ctx)
     )

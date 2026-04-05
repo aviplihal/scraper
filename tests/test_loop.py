@@ -13,6 +13,7 @@ from agent.loop import (
     _conversation_state_summary,
     _maybe_switch_to_discovery_phase,
     _maybe_compact_messages,
+    _no_viable_next_actions,
     _try_automatic_profile_processing,
     run_agent_loop,
 )
@@ -355,6 +356,62 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
         reminder = _build_follow_through_reminder(ctx)
 
         self.assertIn("sample up to 3 viable leads", reminder)
+
+    def test_follow_through_reminder_prefers_discovered_profile_urls(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 10,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.suggest_targets_called = True
+        ctx.fetch_metadata["fetch-search"] = {
+            "url": "https://github.com/search?q=engineer&type=users",
+            "final_url": "https://github.com/search?q=engineer&type=users",
+            "page_kind": "search_results",
+            "title": "Search",
+            "preview": "results",
+        }
+        ctx.processed_fetch_ids.add("fetch-search")
+        ctx.discovered_link_parents["https://github.com/alice-smith"] = "fetch-search"
+        ctx.discovered_link_parents["https://github.com/bob-jones"] = "fetch-search"
+
+        reminder = _build_follow_through_reminder(ctx)
+
+        self.assertIn("Fetch the discovered profile/detail URLs", reminder)
+        self.assertIn("https://github.com/alice-smith", reminder)
+
+    def test_no_viable_next_actions_when_all_candidate_urls_are_budget_exhausted(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 10,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"github.com"}
+        ctx.candidate_domains = ["github.com"]
+        ctx.suggested_targets = [
+            {"url": "https://github.com/search?q=Senior+Software+Engineer&type=users", "domain": "github.com"},
+            {"url": "https://github.com/search?q=Software+Engineer&type=users", "domain": "github.com"},
+        ]
+        ctx.fetch_budget_counts["github.com:search"] = 20
+
+        self.assertTrue(_no_viable_next_actions(ctx))
 
     def test_switch_to_discovery_phase_when_pass1_pool_is_exhausted(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
