@@ -606,7 +606,8 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
             "url": url,
         }
 
-    if ctx.domain_fetch_counts.get(domain, 0) >= _MAX_FETCHES_PER_DOMAIN:
+    fetch_budget = _fetch_budget_for_url(url, ctx)
+    if ctx.domain_fetch_counts.get(domain, 0) >= fetch_budget:
         ctx.fetch_error_count += 1
         return {
             "error": f"Fetch budget reached for domain '{domain}' in this run.",
@@ -907,6 +908,8 @@ async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
             ctx.rejected_weak_count += 1
             source_stats.rejected_count += 1
             _mark_terminal_url(url, "rejected", ctx)
+            if _domain_for_url(url) in {"linkedin.com", "x.com", "twitter.com"}:
+                _record_social_blank_profile(url, ctx)
         logger.info("Rejected weak lead: %s — %s", url, reason)
         print(f"  • Weak lead rejected: {data.get('name') or url} ({reason})", flush=True)
         return {"status": "rejected", "url": url, "reason": reason}
@@ -945,12 +948,19 @@ async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
 def _tool_fail_url(url: str, reason: str, ctx: ToolContext) -> dict:
     logger.info("fail_url: %s — %s", url, reason)
     ctx.failed_url_flag = True
-    ctx.failed_urls.append({"url": url, "reason": reason})
+    normalized_url = _normalize_url(url)
+    existing_outcome = ctx.terminal_url_outcomes.get(normalized_url)
+    if existing_outcome != reason and not any(
+        _normalize_url(str(item.get("url", ""))) == normalized_url and str(item.get("reason", "")) == reason
+        for item in ctx.failed_urls
+    ):
+        ctx.failed_urls.append({"url": url, "reason": reason})
     fetch_id = _lookup_fetch_id(url, ctx)
     if fetch_id:
         ctx.processed_fetch_ids.add(fetch_id)
     _mark_terminal_url(url, reason, ctx)
-    _record_domain_failure(url, reason, ctx)
+    if existing_outcome != reason:
+        _record_domain_failure(url, reason, ctx)
     return {"status": "failed", "url": url, "reason": reason}
 
 
@@ -961,6 +971,8 @@ def _normalize_url(url: str) -> str:
     host = parsed.netloc.lower().split(":", 1)[0]
     if host.startswith("www."):
         host = host[4:]
+    if host == "html.duckduckgo.com":
+        host = "duckduckgo.com"
 
     path = parsed.path or "/"
     if path != "/":
@@ -1001,7 +1013,10 @@ def _domain_for_url(url: str) -> str:
     parsed = urlparse(url)
     if not parsed.scheme and parsed.path:
         parsed = urlparse(f"https://{url}")
-    return parsed.netloc.lower().split(":", 1)[0].removeprefix("www.")
+    host = parsed.netloc.lower().split(":", 1)[0].removeprefix("www.")
+    if host == "html.duckduckgo.com":
+        return "duckduckgo.com"
+    return host
 
 
 def _platform_lock(ctx: ToolContext, platform: str) -> asyncio.Lock:
@@ -1070,7 +1085,7 @@ def _record_social_blank_profile(url: str, ctx: ToolContext) -> None:
             ctx.exhausted_discovery_fetches.add(seed_fetch_id)
 
     ctx.social_platform_failures[platform] = ctx.social_platform_failures.get(platform, 0) + 1
-    if ctx.social_platform_saves.get(platform, 0) == 0 and ctx.social_platform_failures[platform] >= 3:
+    if ctx.social_platform_saves.get(platform, 0) == 0 and ctx.social_platform_failures[platform] >= 2:
         ctx.low_yield_platforms.add(platform)
 
 
@@ -1087,6 +1102,25 @@ def _is_low_yield_platform(url: str, ctx: ToolContext) -> bool:
 def _saved_count(ctx: ToolContext) -> int:
     """Return the run-local viable saved count from the active writer."""
     return int(getattr(ctx.sheets_writer, "saved_count", 0))
+
+
+def _fetch_budget_for_url(url: str, ctx: ToolContext) -> int:
+    """Return the per-run fetch budget for a URL based on domain and run size."""
+    domain = _domain_for_url(url)
+    min_leads = max(1, int(ctx.client_config.get("min_leads", 3) or 3))
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    path = parsed.path.lower()
+    query = parsed.query.lower()
+
+    if domain == "github.com":
+        if path == "/search" and "type=users" in query:
+            return max(12, min_leads * 3)
+        return max(24, min_leads * 6)
+    if domain == "duckduckgo.com":
+        return max(6, min(12, min_leads))
+    if domain in {"linkedin.com", "x.com", "twitter.com"}:
+        return max(6, min_leads * 2)
+    return _MAX_FETCHES_PER_DOMAIN
 
 
 def _has_alternative_allowed_domain(url: str, ctx: ToolContext) -> bool:
@@ -1115,6 +1149,9 @@ def _filter_candidate_targets(targets: list[dict[str, Any]], ctx: ToolContext) -
         if not url or not domain:
             continue
         if domain in ctx.unavailable_domains:
+            continue
+        outcome = ctx.domain_outcomes.get(domain)
+        if outcome and outcome.banned_for_run:
             continue
         if domain == "linkedin.com" and "linkedin" in ctx.low_yield_platforms:
             continue
@@ -1296,6 +1333,8 @@ def _maybe_ban_domain(domain: str, ctx: ToolContext) -> None:
         outcome.banned_for_run = True
     if outcome.irrelevant_count >= 2:
         outcome.banned_for_run = True
+    if outcome.banned_for_run:
+        _remove_domain_from_candidate_pool(domain, ctx)
 
 
 def _record_fetch_outcome(fetch_id: str, domain: str, page_kind: str, ctx: ToolContext) -> None:

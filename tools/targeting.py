@@ -146,7 +146,22 @@ def _candidate_targets_for_strategy(
     search_terms = _dedupe_terms([*primary_terms, *secondary_terms])
     area = str(keyword_brief.get("area", "NA"))
 
-    groups = _catalog_for_strategy(strategy, search_terms, area, _enabled_social_platforms(client_config), source_mode)
+    effective_source_mode = source_mode
+    if (
+        source_mode == "all"
+        and phase == "pass1"
+        and strategy == "technical_profiles"
+        and int(client_config.get("min_leads", 3) or 3) >= 5
+    ):
+        effective_source_mode = "web"
+
+    groups = _catalog_for_strategy(
+        strategy,
+        search_terms,
+        area,
+        _enabled_social_platforms(client_config),
+        effective_source_mode,
+    )
     if phase == "discovery" and source_mode in {"web", "all"}:
         groups.extend(_web_discovery_target_groups(strategy, search_terms, area))
     if source_state is None:

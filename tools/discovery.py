@@ -408,7 +408,11 @@ def _looks_like_duckduckgo_error_page(host: str, path: str, title_lower: str, te
         return False
     if path.startswith("/static-pages/418"):
         return True
-    return "duckduckgo" in title_lower and ("error getting results" in text_lower or "418" in title_lower)
+    return "duckduckgo" in title_lower and (
+        "error getting results" in text_lower
+        or "418" in title_lower
+        or "if this persists, please email us" in text_lower
+    )
 
 
 def _looks_like_duckduckgo_results(

@@ -140,6 +140,27 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("x.com", result["allowed_domains"])
         self.assertTrue(all(target["domain"] not in {"linkedin.com", "x.com"} for target in result["candidate_targets"]))
 
+    async def test_suggest_targets_filters_banned_domains(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 10,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.domain_outcomes["gitlab.com"] = DomainOutcome(blocked_count=1, banned_for_run=True)
+
+        result = await dispatch_tool("suggest_targets", {"limit": 8}, ctx)
+
+        self.assertNotIn("gitlab.com", result["allowed_domains"])
+        self.assertTrue(all(target["domain"] != "gitlab.com" for target in result["candidate_targets"]))
+
     async def test_suggest_targets_returns_curated_leadership_targets(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
@@ -232,6 +253,39 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         ctx.suggest_targets_called = True
         ctx.allowed_domains = {"github.com"}
         ctx.candidate_domains = ["github.com"]
+
+        class _FakeFetchResult:
+            final_url = "https://github.com/alice-smith"
+            html = "<html><head><title>Alice Smith</title></head><body><h1>Alice Smith</h1></body></html>"
+
+        with patch("tools.registry.smart_fetch", return_value=_FakeFetchResult()):
+            result = await dispatch_tool(
+                "fetch_page",
+                {"url": "https://github.com/alice-smith", "needs_javascript": False},
+                ctx,
+            )
+
+        self.assertEqual(result["page_kind"], "profile")
+
+    async def test_large_github_runs_get_higher_fetch_budget(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 10,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+            scraper_browser=_FakeScraperBrowser(),
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"github.com"}
+        ctx.candidate_domains = ["github.com"]
+        ctx.domain_fetch_counts["github.com"] = 8
 
         class _FakeFetchResult:
             final_url = "https://github.com/alice-smith"
@@ -555,11 +609,49 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "rejected")
         self.assertIn("handle", result["reason"])
 
+    async def test_save_result_rejected_linkedin_lead_triggers_low_yield_cooldown(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "NA",
+                "min_leads": 10,
+                "social_platforms": ["linkedin"],
+            },
+            sheets_writer=writer,
+            source_mode="all",
+        )
+
+        first = await dispatch_tool(
+            "save_result",
+            {
+                "url": "https://linkedin.com/in/alice",
+                "data": {"name": "Alice", "social_media": "https://linkedin.com/in/alice"},
+            },
+            ctx,
+        )
+        second = await dispatch_tool(
+            "save_result",
+            {
+                "url": "https://linkedin.com/in/bob",
+                "data": {"name": "Bob", "social_media": "https://linkedin.com/in/bob"},
+            },
+            ctx,
+        )
+
+        self.assertEqual(first["status"], "rejected")
+        self.assertEqual(second["status"], "rejected")
+        self.assertIn("linkedin", ctx.low_yield_platforms)
+
     def test_social_profile_urls_canonicalize_mini_profile_variants(self) -> None:
         self.assertEqual(
             _normalize_url("https://www.linkedin.com/in/test-person?miniProfileUrn=abc"),
             _normalize_url("https://www.linkedin.com/in/test-person/"),
         )
+
+    def test_normalize_url_canonicalizes_html_duckduckgo_host(self) -> None:
+        normalized = _normalize_url("https://html.duckduckgo.com/html?q=site%3Agithub.com+alice")
+        self.assertTrue(normalized.startswith("https://duckduckgo.com/html?q="))
 
     async def test_social_url_routes_through_matching_adapter(self) -> None:
         writer = _DummyWriter()
@@ -1053,6 +1145,35 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["url"], "https://www.crunchbase.com/people")
         self.assertIn("fetch-5", ctx.processed_fetch_ids)
+
+    async def test_fail_url_deduplicates_same_reason(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        first = await dispatch_tool(
+            "fail_url",
+            {
+                "url": "https://gitlab.com/users/sign_in",
+                "reason": "Automatic cleanup: blocked page is not a viable discovery target.",
+            },
+            ctx,
+        )
+        second = await dispatch_tool(
+            "fail_url",
+            {
+                "url": "https://gitlab.com/users/sign_in",
+                "reason": "Automatic cleanup: blocked page is not a viable discovery target.",
+            },
+            ctx,
+        )
+
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(second["status"], "failed")
+        self.assertEqual(len(ctx.failed_urls), 1)
 
     async def test_blocked_fetch_bans_domain_for_run(self) -> None:
         writer = _DummyWriter()

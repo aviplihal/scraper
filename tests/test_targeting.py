@@ -170,6 +170,24 @@ class TargetingTests(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_large_all_mode_technical_pass1_prefers_web_targets(self) -> None:
+        config = {
+            "client_id": "example_client",
+            "job": "find senior software engineers open to new opportunities",
+            "job_title": "Senior Software Engineer",
+            "area": "San Francisco Bay Area",
+            "website": "NA",
+            "min_leads": 10,
+            "social_platforms": ["linkedin", "x"],
+        }
+
+        result = suggest_targets(config, "all", limit=6, phase="pass1")
+
+        domains = [target["domain"] for target in result["candidate_targets"]]
+        self.assertIn("github.com", domains)
+        self.assertNotIn("linkedin.com", domains)
+        self.assertNotIn("x.com", domains)
+
 
 if __name__ == "__main__":
     unittest.main()

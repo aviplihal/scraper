@@ -198,6 +198,22 @@ class DiscoveryTests(unittest.TestCase):
 
         self.assertEqual(page_info.page_kind, "blocked")
 
+    def test_classify_duckduckgo_persist_error_page_as_blocked(self) -> None:
+        html = """
+        <html>
+          <head><title>DuckDuckGo</title></head>
+          <body>If this persists, please email us.</body>
+        </html>
+        """
+
+        page_info = classify_page(
+            "https://duckduckgo.com/html?q=site%3Agithub.com+senior+engineer",
+            "https://html.duckduckgo.com/html?q=site%3Agithub.com+senior+engineer",
+            html,
+        )
+
+        self.assertEqual(page_info.page_kind, "blocked")
+
     def test_extract_links_prefers_people_links_from_company_page(self) -> None:
         html = """
         <html>
