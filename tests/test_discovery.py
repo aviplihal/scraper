@@ -39,6 +39,17 @@ class DiscoveryTests(unittest.TestCase):
         job_board = classify_page("https://www.dice.com/jobs/search", "https://www.dice.com/jobs/search", jobs_html)
         self.assertEqual(job_board.page_kind, "job_board")
 
+        gitlab_login_html = """
+        <html><head><title>Sign in · GitLab</title></head>
+        <body>Sign in or sign up before continuing to GitLab</body></html>
+        """
+        auth_wall = classify_page(
+            "https://gitlab.com/explore/users?search=Senior+Software+Engineer",
+            "https://gitlab.com/users/sign_in",
+            gitlab_login_html,
+        )
+        self.assertEqual(auth_wall.page_kind, "blocked")
+
     def test_classify_company_directory_company_page_and_news(self) -> None:
         yc_directory = """
         <html><head><title>The YC Startup Directory | Y Combinator</title></head><body>Startup directory</body></html>
@@ -108,6 +119,8 @@ class DiscoveryTests(unittest.TestCase):
             <a href="/team">Team</a>
             <a href="/topics">Topics</a>
             <a href="/accelerator">Accelerator</a>
+            <a href="/mcp">MCP Registry New Integrate external tools</a>
+            <a href="/partners">Partners</a>
             <a href="/alice-smith">Alice Smith</a>
             <a href="/bob-jones">Bob Jones</a>
           </body>

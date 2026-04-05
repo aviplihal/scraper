@@ -19,6 +19,14 @@ _BLOCKED_MARKERS = (
     "we must verify your session",
 )
 
+_AUTH_REQUIRED_MARKERS = (
+    "sign in or sign up before continuing",
+    "sign in to gitlab",
+    "sign in to continue",
+    "log in to continue",
+    "authentication required",
+)
+
 _NOT_FOUND_MARKERS = (
     "page not found",
     "404",
@@ -192,10 +200,12 @@ _GITHUB_RESERVED_SEGMENTS = {
     "issues",
     "login",
     "marketplace",
+    "mcp",
     "new",
     "notifications",
     "orgs",
     "organizations",
+    "partners",
     "pricing",
     "premium-support",
     "pulls",
@@ -209,8 +219,10 @@ _GITHUB_RESERVED_SEGMENTS = {
     "solutions",
     "sponsors",
     "team",
+    "trust-center",
     "topics",
     "trending",
+    "why-github",
 }
 
 
@@ -237,6 +249,9 @@ def classify_page(url: str, final_url: str, html: str) -> PageInfo:
     path_segments = [segment for segment in path.split("/") if segment]
 
     if _contains_marker(title_lower, text_lower, _BLOCKED_MARKERS):
+        return PageInfo(final_url=final_url or url, title=title, page_kind="blocked")
+
+    if _looks_like_auth_wall(host, path, path_segments, title_lower, text_lower):
         return PageInfo(final_url=final_url or url, title=title, page_kind="blocked")
 
     if _contains_marker(title_lower, text_lower, _NOT_FOUND_MARKERS):
@@ -327,6 +342,25 @@ def extract_links(
 
 def _contains_marker(title_lower: str, text_lower: str, markers: tuple[str, ...]) -> bool:
     return any(marker in title_lower or marker in text_lower for marker in markers)
+
+
+def _looks_like_auth_wall(
+    host: str,
+    path: str,
+    path_segments: list[str],
+    title_lower: str,
+    text_lower: str,
+) -> bool:
+    """Return True when a page is clearly a login/auth wall instead of usable content."""
+    if _contains_marker(title_lower, text_lower, _AUTH_REQUIRED_MARKERS):
+        return True
+    if path in {"/users/sign_in", "/login", "/signin", "/sign_in"}:
+        return True
+    if any(segment in {"login", "signin", "sign_in"} for segment in path_segments):
+        return True
+    if host == "gitlab.com" and path.startswith("/users/sign_in"):
+        return True
+    return title_lower.startswith(("sign in", "log in", "login"))
 
 
 def _looks_like_job_board(path: str, title_lower: str, text_lower: str) -> bool:

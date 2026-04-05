@@ -816,7 +816,7 @@ def _needs_target_fetch_follow_through(ctx: ToolContext) -> bool:
     if _remaining_discovery_fetch_ids(ctx):
         return False
 
-    return bool(_remaining_candidate_domains(ctx))
+    return bool(_remaining_candidate_target_urls(ctx) or _remaining_candidate_domains(ctx))
 
 
 def _print_targeting_brief(result: dict) -> None:
@@ -873,6 +873,31 @@ def _remaining_candidate_domains(ctx: ToolContext) -> list[str]:
     return remaining
 
 
+def _remaining_candidate_target_urls(ctx: ToolContext) -> list[str]:
+    """Return starter target URLs that have not been fetched or exhausted yet."""
+    remaining: list[str] = []
+    seen: set[str] = set()
+    for target in ctx.suggested_targets:
+        if not isinstance(target, dict):
+            continue
+        url = str(target.get("url", "")).strip()
+        if not url:
+            continue
+        normalized_url = _normalize_url(url)
+        domain = _domain_for_url(url)
+        if (
+            normalized_url in seen
+            or domain in getattr(ctx, "unavailable_domains", set())
+            or normalized_url in getattr(ctx, "exhausted_discovery_urls", set())
+            or normalized_url in getattr(ctx, "url_to_fetch_id", {})
+            or normalized_url in getattr(ctx, "terminal_url_outcomes", {})
+        ):
+            continue
+        seen.add(normalized_url)
+        remaining.append(url)
+    return remaining
+
+
 def _remaining_discovery_fetch_ids(ctx: ToolContext) -> list[str]:
     """Return discovery pages that still have unseen candidate links."""
     remaining: list[str] = []
@@ -897,8 +922,10 @@ def _domain_on_low_yield_cooldown(domain: str, ctx: ToolContext) -> bool:
 def _candidate_preview_urls(ctx: ToolContext, limit: int = 3) -> list[str]:
     """Return a few suggested starter URLs, preferring domains not fetched yet."""
     preview_urls: list[str] = []
+    remaining_target_urls = _remaining_candidate_target_urls(ctx)
     remaining_domains = _remaining_candidate_domains(ctx)
     prioritized_targets = list(ctx.suggested_targets)
+    remaining_target_url_set = {url for url in remaining_target_urls}
 
     if remaining_domains:
         for domain in remaining_domains:
@@ -909,6 +936,7 @@ def _candidate_preview_urls(ctx: ToolContext, limit: int = 3) -> list[str]:
                 if (
                     not url
                     or url in preview_urls
+                    or url not in remaining_target_url_set
                     or _domain_for_url(url) in getattr(ctx, "unavailable_domains", set())
                     or _normalize_url(url) in getattr(ctx, "exhausted_discovery_urls", set())
                 ):
@@ -923,6 +951,7 @@ def _candidate_preview_urls(ctx: ToolContext, limit: int = 3) -> list[str]:
         if (
             not url
             or url in preview_urls
+            or (remaining_target_url_set and url not in remaining_target_url_set)
             or _domain_for_url(url) in getattr(ctx, "unavailable_domains", set())
             or _normalize_url(url) in getattr(ctx, "exhausted_discovery_urls", set())
         ):
@@ -962,7 +991,7 @@ def _follow_through_signature(ctx: ToolContext) -> tuple[int, int, int, int, str
     return (
         len(_unprocessed_fetch_ids(ctx)),
         len(_remaining_discovery_fetch_ids(ctx)),
-        len(_remaining_candidate_domains(ctx)),
+        len(_remaining_candidate_target_urls(ctx)) + len(_remaining_candidate_domains(ctx)),
         _saved_lead_count(ctx),
         ctx.source_phase,
     )

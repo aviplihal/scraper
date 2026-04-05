@@ -406,6 +406,60 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_pass1_does_not_switch_to_discovery_when_unfetched_target_urls_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="pass1",
+                )
+                ctx.suggest_targets_called = True
+                ctx.allowed_domains = {"github.com"}
+                ctx.candidate_domains = ["github.com"]
+                ctx.suggested_targets = [
+                    {"url": "https://github.com/search?q=Senior+Software+Engineer&type=users", "domain": "github.com"},
+                    {"url": "https://github.com/search?q=Software+Engineer&type=users", "domain": "github.com"},
+                ]
+                ctx.fetch_metadata["fetch-1"] = {
+                    "url": "https://github.com/search?q=Senior+Software+Engineer&type=users",
+                    "final_url": "https://github.com/search?q=Senior+Software+Engineer&type=users",
+                    "title": "User search results · GitHub",
+                    "page_kind": "search_results",
+                    "preview": "results",
+                }
+                ctx.url_to_fetch_id["https://github.com/search?q=Senior+Software+Engineer&type=users"] = "fetch-1"
+                ctx.exhausted_discovery_fetches.add("fetch-1")
+                ctx.exhausted_discovery_urls.add("https://github.com/search?q=Senior+Software+Engineer&type=users")
+                ctx.processed_fetch_ids.add("fetch-1")
+
+                messages: list[dict] = []
+                switched = _maybe_switch_to_discovery_phase(ctx, messages)
+
+                self.assertFalse(switched)
+                self.assertEqual(ctx.source_phase, "pass1")
+            finally:
+                os.chdir(old_cwd)
+
     async def test_auto_fail_remaining_non_actionable_pages_marks_pages_processed(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(

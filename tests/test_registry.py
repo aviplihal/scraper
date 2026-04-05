@@ -476,6 +476,20 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(normalized["job_title"], "Senior software engineer")
         self.assertEqual(normalized["company"], "Vanta Inc")
 
+    def test_normalize_lead_payload_extracts_clean_role_from_complex_github_bio(self) -> None:
+        normalized = _normalize_lead_payload(
+            "https://github.com/manastungare",
+            {
+                "name": "Manas Tungare",
+                "job_title": "Primary GitHub →@chimbori• Senior Staff Software Engineer (L7)@google• UberTL for Gmail Productivity • Ph.D. Computer Science",
+                "company": "@chimbori",
+                "social_media": "https://manas.tungare.name/",
+            },
+        )
+
+        self.assertEqual(normalized["job_title"], "Senior Staff Software Engineer (L7)")
+        self.assertEqual(normalized["company"], "Google")
+
     def test_social_profile_urls_canonicalize_mini_profile_variants(self) -> None:
         self.assertEqual(
             _normalize_url("https://www.linkedin.com/in/test-person?miniProfileUrn=abc"),

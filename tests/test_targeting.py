@@ -143,6 +143,30 @@ class TargetingTests(unittest.TestCase):
                 self.assertNotIn("gitlab.com", domains)
                 self.assertNotIn("linkedin.com", domains)
                 self.assertIn("x.com", domains)
+                self.assertIn("duckduckgo.com", domains)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_discovery_web_mode_adds_public_search_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                config = {
+                    "client_id": "example_client",
+                    "job": "find senior software engineers open to new opportunities",
+                    "job_title": "Senior Software Engineer",
+                    "area": "San Francisco Bay Area",
+                    "website": "NA",
+                    "min_leads": 3,
+                    "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                }
+                state = SourceState("example_client", config)
+
+                result = suggest_targets(config, "web", limit=8, source_state=state, phase="discovery")
+
+                domains = [target["domain"] for target in result["candidate_targets"]]
+                self.assertIn("duckduckgo.com", domains)
             finally:
                 os.chdir(old_cwd)
 

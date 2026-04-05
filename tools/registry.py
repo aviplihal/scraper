@@ -1626,6 +1626,9 @@ def _curated_target_pool_exhausted(ctx: ToolContext) -> bool:
     if not _uses_curated_target_pool(ctx) or not ctx.suggest_targets_called:
         return False
 
+    if _has_remaining_target_urls(ctx):
+        return False
+
     candidate_domains = ctx.candidate_domains or sorted(ctx.allowed_domains)
     if not candidate_domains:
         return False
@@ -1640,6 +1643,28 @@ def _curated_target_pool_exhausted(ctx: ToolContext) -> bool:
             return False
 
     return not any(fetch_id not in ctx.processed_fetch_ids for fetch_id in ctx.fetch_metadata)
+
+
+def _has_remaining_target_urls(ctx: ToolContext) -> bool:
+    """Return True when suggest_targets still has starter URLs that have not been tried."""
+    for target in ctx.suggested_targets:
+        if not isinstance(target, dict):
+            continue
+        url = str(target.get("url", "")).strip()
+        if not url:
+            continue
+        normalized_url = _normalize_url(url)
+        domain = _domain_for_url(url)
+        if domain in ctx.unavailable_domains:
+            continue
+        if _terminal_outcome_for_url(url, ctx):
+            continue
+        if normalized_url in ctx.exhausted_discovery_urls:
+            continue
+        if normalized_url in ctx.url_to_fetch_id:
+            continue
+        return True
+    return False
 
 
 def _is_plausible_person_name(value: Any) -> bool:
@@ -1686,8 +1711,16 @@ def _normalize_lead_payload(source_url: str, data: dict[str, Any]) -> dict[str, 
             normalized[key] = cleaned if cleaned else None
 
     raw_job_title = normalized.get("job_title")
+    role_hint_title, role_hint_company = _extract_role_company_from_bio_text(raw_job_title)
     normalized["job_title"] = _normalize_job_title_value(normalized.get("job_title"))
     normalized["company"] = _normalize_company_value(normalized.get("company"))
+    if _has_meaningful_value(role_hint_title):
+        normalized["job_title"] = role_hint_title
+    if _has_meaningful_value(role_hint_company) and (
+        not _has_meaningful_value(normalized.get("company"))
+        or _should_prefer_role_hint_company(raw_job_title)
+    ):
+        normalized["company"] = role_hint_company
     if not _has_meaningful_value(normalized.get("company")):
         hinted_company = _derive_company_from_job_title_hint(raw_job_title)
         if _has_meaningful_value(hinted_company):
@@ -1732,6 +1765,7 @@ def _normalize_job_title_value(value: Any) -> Any:
         text = text.split(" {", 1)[0].strip()
 
     text = re.sub(r"\s+at\s*$", "", text, flags=re.IGNORECASE).strip()
+    text = text.rstrip(".,;:").strip()
 
     return text or None
 
@@ -1774,6 +1808,29 @@ def _split_title_company(job_title: Any, company: Any) -> tuple[Any, Any]:
     return clean_title or title, resolved_company
 
 
+def _extract_role_company_from_bio_text(job_title: Any) -> tuple[Any, Any]:
+    """Recover a cleaner role/company pair from multi-segment GitHub-style bio text."""
+    if not isinstance(job_title, str):
+        return None, None
+    text = _clean_field_text(job_title)
+    if not text:
+        return None, None
+
+    segments = [segment.strip(" -–—>•|·") for segment in re.split(r"[•|·]+", text) if segment.strip()]
+    for segment in segments:
+        candidate_title, candidate_company = _split_title_company(segment, None)
+        if isinstance(candidate_title, str) and "@" in candidate_title:
+            left, right = [part.strip() for part in candidate_title.split("@", 1)]
+            if _looks_like_title_fragment(left):
+                return _normalize_job_title_value(left), _normalize_company_value(f"@{right}")
+        if isinstance(candidate_title, str) and _looks_like_title_fragment(candidate_title):
+            normalized_title = _normalize_job_title_value(candidate_title)
+            normalized_company = _normalize_company_value(candidate_company)
+            return normalized_title, normalized_company
+
+    return None, None
+
+
 def _derive_company_from_job_title_hint(job_title: Any) -> Any:
     """Recover simple handle-style company text embedded in a job-title string."""
     if not isinstance(job_title, str):
@@ -1789,6 +1846,13 @@ def _derive_company_from_job_title_hint(job_title: Any) -> Any:
     if not _looks_like_title_fragment(title_hint):
         return None
     return _normalize_company_value(f"@{company_hint}")
+
+
+def _should_prefer_role_hint_company(job_title: Any) -> bool:
+    """Return True when a role-derived company should override a weaker parsed company."""
+    if not isinstance(job_title, str):
+        return False
+    return any(marker in job_title for marker in ("•", "·", "|")) or job_title.count("@") >= 2
 
 
 def _normalize_social_value(value: Any, source_url: str) -> Any:

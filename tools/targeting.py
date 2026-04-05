@@ -147,6 +147,8 @@ def _candidate_targets_for_strategy(
     area = str(keyword_brief.get("area", "NA"))
 
     groups = _catalog_for_strategy(strategy, search_terms, area, _enabled_social_platforms(client_config), source_mode)
+    if phase == "discovery" and source_mode in {"web", "all"}:
+        groups.extend(_web_discovery_target_groups(strategy, search_terms, area))
     if source_state is None:
         return _interleave_target_groups([group["targets"] for group in groups])
 
@@ -252,6 +254,23 @@ def _gitlab_search_target(term: str, area: str) -> dict[str, object]:
         reason=f"Public GitLab user search matching '{query}'.",
         source_kind="web_domain",
         source_id="gitlab.com",
+    )
+
+
+def _duckduckgo_profile_search_target(term: str, area: str, site_domain: str = "github.com") -> dict[str, object]:
+    query_parts = [f"site:{site_domain}"]
+    if term.strip():
+        query_parts.append(f'"{term.strip()}"')
+    if area and area.upper() != "NA":
+        query_parts.append(f'"{area}"')
+    query = " ".join(query_parts).strip()
+    return _candidate_target(
+        f"https://duckduckgo.com/html/?q={quote_plus(query)}",
+        source="web",
+        family="developer_profiles",
+        reason=f"Public web search for developer profiles matching {query}.",
+        source_kind="web_domain",
+        source_id="duckduckgo.com",
     )
 
 
@@ -422,6 +441,29 @@ def _web_target_groups(strategy: str, search_terms: list[str], area: str) -> lis
         }
     )
     return groups
+
+
+def _web_discovery_target_groups(strategy: str, search_terms: list[str], area: str) -> list[dict[str, object]]:
+    """Return broader public-web fallback targets for discovery mode."""
+    if strategy not in {"technical_profiles", "marketing_sales_people", "general_people", "leadership_people"}:
+        return []
+
+    targets = [
+        _duckduckgo_profile_search_target(term, area, site_domain=site_domain)
+        for site_domain in ("github.com", "gitlab.com")
+        for term in search_terms[:2]
+    ]
+    if not targets:
+        return []
+    return [
+        {
+            "kind": "web_domain",
+            "identifier": "duckduckgo.com",
+            "domain": "duckduckgo.com",
+            "family": "developer_profiles",
+            "targets": targets,
+        }
+    ]
 
 
 def _pass1_groups(groups: list[dict[str, object]], source_state: SourceState) -> list[dict[str, object]]:
