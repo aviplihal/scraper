@@ -7,8 +7,10 @@ Flow per step:
   4. Repeat up to MAX_STEPS times.
 """
 
+import asyncio
 import json
 import logging
+import re
 
 import ollama
 
@@ -25,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 MODEL      = "qwen3.5:9b"
 MAX_STEPS  = 100
+_PROMPT_TOKEN_COMPACT_THRESHOLD = 2500
+_MESSAGE_COMPACT_THRESHOLD = 12
+_AUTO_PROFILE_BATCH_SIZE = 2
+_FAKE_TOOL_CALL_PATTERN = re.compile(r"\b(fetch_page|fetch_url|list_links|parse_html|save_result|fail_url|suggest_targets)\s*\(")
 
 
 async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
@@ -41,6 +47,11 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
         "steps_run": 0,
         "status": "unknown",
         "stop_reason": "",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "max_prompt_tokens": 0,
+        "compactions": 0,
     }
 
     print("\n=== Job Start ===")
@@ -55,6 +66,7 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
     for step in range(1, MAX_STEPS + 1):
         run_result["steps_run"] = step
         logger.debug("Step %d / %d", step, MAX_STEPS)
+        _maybe_compact_messages(messages, ctx, run_result)
 
         try:
             response = await client.chat(
@@ -63,6 +75,11 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                 tools=TOOL_DEFINITIONS,
                 options={"temperature": 0.1, "num_predict": 2048},
             )
+            _accumulate_token_usage(run_result, response)
+        except asyncio.CancelledError:
+            run_result["status"] = "interrupted"
+            run_result["stop_reason"] = "Run interrupted while waiting for the model."
+            raise
         except Exception as exc:
             if await _try_automatic_profile_processing(ctx, messages, step):
                 if _lead_target_reached(ctx):
@@ -101,22 +118,6 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
         messages.append({"role": "assistant", "content": message.content or "", "tool_calls": message.tool_calls})
 
         if not message.tool_calls:
-            current_signature = _follow_through_signature(ctx)
-            if current_signature != last_follow_through_signature:
-                follow_through_reminders = 0
-                last_follow_through_signature = current_signature
-
-            if _should_request_follow_through(ctx) and follow_through_reminders < 2:
-                follow_through_reminders += 1
-                reminder = _build_follow_through_reminder(ctx)
-                print(f"[agent] Reminder: {reminder}", flush=True)
-                messages.append({"role": "user", "content": reminder})
-                continue
-
-            if await _auto_fail_remaining_non_actionable_pages(ctx, messages, step):
-                if _should_request_follow_through(ctx):
-                    continue
-
             if await _try_automatic_profile_processing(ctx, messages, step):
                 if _lead_target_reached(ctx):
                     print(
@@ -126,18 +127,29 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                     )
                     run_result["status"] = "completed"
                     run_result["stop_reason"] = _lead_target_stop_reason(ctx)
-                else:
-                    print(
-                        "[agent] Automatic profile processing completed for outstanding fetched "
-                        "profile pages, but the lead target is still unmet.",
-                        flush=True,
-                    )
-                    run_result["status"] = "completed"
-                    run_result["stop_reason"] = _under_target_stop_reason(
-                        ctx,
-                        "Automatic profile processing completed but could not reach the lead target",
-                    )
-                break
+                    break
+                if _should_request_follow_through(ctx):
+                    continue
+
+            if await _auto_fail_remaining_non_actionable_pages(ctx, messages, step):
+                if _should_request_follow_through(ctx):
+                    continue
+
+            current_signature = _follow_through_signature(ctx)
+            if current_signature != last_follow_through_signature:
+                follow_through_reminders = 0
+                last_follow_through_signature = current_signature
+
+            if _should_request_follow_through(ctx) and follow_through_reminders < 2:
+                follow_through_reminders += 1
+                reminder = (
+                    _build_fake_tool_call_correction(ctx)
+                    if _looks_like_fake_tool_calls(message.content or "")
+                    else _build_follow_through_reminder(ctx)
+                )
+                print(f"[agent] Reminder: {reminder}", flush=True)
+                messages.append({"role": "user", "content": reminder})
+                continue
 
             if _maybe_switch_to_discovery_phase(ctx, messages):
                 continue
@@ -151,52 +163,28 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
             )
             break
 
-        # Execute tool calls and append results
-        reached_target_this_step = False
-        for tool_call in message.tool_calls:
-            tool_name = tool_call.function.name
-            raw_args  = tool_call.function.arguments
+        reached_target_this_step = await _execute_tool_calls(
+            step,
+            message.tool_calls,
+            ctx,
+            messages,
+            run_result,
+        )
+        follow_through_reminders = 0
+        last_follow_through_signature = _follow_through_signature(ctx)
+        if reached_target_this_step:
+            break
 
-            # Ollama may return arguments as a dict or as a JSON string
-            if isinstance(raw_args, str):
-                try:
-                    arguments = json.loads(raw_args)
-                except json.JSONDecodeError:
-                    arguments = {}
-            else:
-                arguments = raw_args or {}
-
-            print(f"[step {step}] → {tool_name}({_fmt_args(arguments)})", flush=True)
-
-            result = await dispatch_tool(tool_name, arguments, ctx)
-            result_str = json.dumps(result, ensure_ascii=False)
-
-            print(f"[step {step}] ← {result_str[:300]}", flush=True)
-            if tool_name == "suggest_targets" and "error" not in result:
-                _print_targeting_brief(result)
-
-            messages.append({"role": "tool", "content": result_str})
-
-            if "error" not in result:
-                follow_through_reminders = 0
-                last_follow_through_signature = _follow_through_signature(ctx)
-
-            # fail_url signals we should stop processing the current URL
-            if ctx.failed_url_flag:
-                ctx.failed_url_flag = False
-
+        if await _try_automatic_profile_processing(ctx, messages, step):
             if _lead_target_reached(ctx):
-                reached_target_this_step = True
-                run_result["status"] = "completed"
-                run_result["stop_reason"] = _lead_target_stop_reason(ctx)
                 print(
                     f"\n[agent] Lead target reached after step {step} — job stopped.",
                     flush=True,
                 )
+                run_result["status"] = "completed"
+                run_result["stop_reason"] = _lead_target_stop_reason(ctx)
                 break
 
-        if reached_target_this_step:
-            break
 
     else:
         print(f"\n[agent] MAX_STEPS ({MAX_STEPS}) reached — job stopped.")
@@ -211,6 +199,280 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
         run_result["stop_reason"] = "Run exited without an explicit stop reason."
 
     return run_result
+
+
+async def _execute_tool_calls(
+    step: int,
+    tool_calls: list,
+    ctx: ToolContext,
+    messages: list[dict],
+    run_result: dict,
+) -> bool:
+    """Execute model-emitted tool calls, batching safe I/O work concurrently."""
+    index = 0
+    while index < len(tool_calls):
+        batch = [tool_calls[index]]
+        batch_tool_name = _normalized_tool_name(tool_calls[index].function.name)
+        index += 1
+        while (
+            index < len(tool_calls)
+            and _normalized_tool_name(tool_calls[index].function.name) == batch_tool_name
+            and batch_tool_name in {"fetch_page", "parse_html", "save_result"}
+        ):
+            batch.append(tool_calls[index])
+            index += 1
+
+        if len(batch) > 1 and batch_tool_name in {"fetch_page", "parse_html", "save_result"}:
+            results = await _run_tool_batch_concurrently(step, batch_tool_name, batch, ctx)
+        else:
+            results = [await _run_single_tool_call(step, batch[0], ctx)]
+
+        for tool_name, result in results:
+            if tool_name == "suggest_targets" and "error" not in result:
+                _print_targeting_brief(result)
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "content": _tool_history_content(tool_name, result, ctx),
+                }
+            )
+
+            if "error" not in result:
+                # Reset reminder pressure once we make progress.
+                pass
+
+            if ctx.failed_url_flag:
+                ctx.failed_url_flag = False
+
+            if _lead_target_reached(ctx):
+                run_result["status"] = "completed"
+                run_result["stop_reason"] = _lead_target_stop_reason(ctx)
+                print(
+                    f"\n[agent] Lead target reached after step {step} — job stopped.",
+                    flush=True,
+                )
+                return True
+
+    return False
+
+
+async def _run_tool_batch_concurrently(
+    step: int,
+    batch_tool_name: str,
+    tool_calls: list,
+    ctx: ToolContext,
+) -> list[tuple[str, dict]]:
+    """Run a safe same-tool batch concurrently and return results in call order."""
+    semaphore = asyncio.Semaphore(2)
+
+    async def _run(tool_call) -> tuple[str, dict]:
+        async with semaphore:
+            return await _run_single_tool_call(step, tool_call, ctx)
+
+    return list(await asyncio.gather(*[_run(tool_call) for tool_call in tool_calls]))
+
+
+async def _run_single_tool_call(step: int, tool_call, ctx: ToolContext) -> tuple[str, dict]:
+    """Execute one tool call and print its terminal trace."""
+    tool_name = _normalized_tool_name(tool_call.function.name)
+    arguments = _tool_arguments(tool_call)
+
+    print(f"[step {step}] → {tool_name}({_fmt_args(arguments)})", flush=True)
+    result = await dispatch_tool(tool_name, arguments, ctx)
+    result_str = json.dumps(result, ensure_ascii=False)
+    print(f"[step {step}] ← {result_str[:300]}", flush=True)
+    return tool_name, result
+
+
+def _normalized_tool_name(tool_name: str) -> str:
+    """Normalize model-emitted tool names to the supported registry names."""
+    return "fetch_page" if tool_name == "fetch_url" else tool_name
+
+
+def _tool_arguments(tool_call) -> dict:
+    """Normalize model-emitted tool arguments into a plain dict."""
+    raw_args = tool_call.function.arguments
+    if isinstance(raw_args, str):
+        try:
+            return json.loads(raw_args)
+        except json.JSONDecodeError:
+            return {}
+    return raw_args or {}
+
+
+def _accumulate_token_usage(run_result: dict, response: object) -> None:
+    """Accumulate Ollama prompt/completion token counts when available."""
+    prompt_tokens = _safe_int(getattr(response, "prompt_eval_count", None))
+    completion_tokens = _safe_int(getattr(response, "eval_count", None))
+
+    run_result["last_prompt_tokens"] = prompt_tokens
+    run_result["prompt_tokens"] += prompt_tokens
+    run_result["completion_tokens"] += completion_tokens
+    run_result["max_prompt_tokens"] = max(run_result.get("max_prompt_tokens", 0), prompt_tokens)
+    run_result["total_tokens"] = (
+        run_result["prompt_tokens"] + run_result["completion_tokens"]
+    )
+
+
+def _safe_int(value: object) -> int:
+    """Convert Ollama numeric metadata to an int, defaulting to zero."""
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _maybe_compact_messages(messages: list[dict], ctx: ToolContext, run_result: dict) -> None:
+    """Compact older conversation history when prompt state grows too large."""
+    non_system_messages = max(0, len(messages) - 2)
+    if (
+        run_result.get("last_prompt_tokens", 0) <= _PROMPT_TOKEN_COMPACT_THRESHOLD
+        and non_system_messages <= _MESSAGE_COMPACT_THRESHOLD
+    ):
+        return
+    if len(messages) <= 3:
+        return
+
+    tail = messages[2:][-6:]
+    summary_message = {
+        "role": "user",
+        "content": _conversation_state_summary(ctx),
+    }
+    messages[:] = messages[:2] + [summary_message] + tail
+    run_result["compactions"] = run_result.get("compactions", 0) + 1
+
+
+def _conversation_state_summary(ctx: ToolContext) -> str:
+    """Build a compact state summary that preserves the active scrape context."""
+    keyword_brief = ctx.keyword_brief or {}
+    primary_terms = ", ".join(keyword_brief.get("primary_terms", [])) or "n/a"
+    secondary_terms = ", ".join(keyword_brief.get("secondary_terms", [])) or "n/a"
+    allowed_domains = ", ".join(ctx.candidate_domains or sorted(ctx.allowed_domains)) or "n/a"
+    avoid_domains = ", ".join(ctx.avoid_domains) or "none"
+    low_yield = ", ".join(sorted(ctx.low_yield_platforms)) or "none"
+
+    unprocessed = []
+    for fetch_id in _unprocessed_fetch_ids(ctx)[:5]:
+        metadata = ctx.fetch_metadata.get(fetch_id, {})
+        url = metadata.get("final_url") or metadata.get("url") or "unknown"
+        page_kind = metadata.get("page_kind", "unknown")
+        unprocessed.append(f"{fetch_id}:{page_kind}:{url}")
+    parsed_pending = []
+    for fetch_id, fields in list(ctx.parsed_results.items())[-3:]:
+        metadata = ctx.fetch_metadata.get(fetch_id, {})
+        url = metadata.get("final_url") or metadata.get("url") or "unknown"
+        parsed_pending.append(f"{fetch_id}:{url}:{json.dumps(fields, ensure_ascii=False)[:160]}")
+    failures = [f"{item['reason']}:{item['url']}" for item in ctx.failed_urls[-5:]]
+
+    return (
+        "Context summary for the ongoing lead scrape.\n"
+        f"Progress: saved={_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads.\n"
+        f"Source phase: {ctx.source_phase}. Strategy: {ctx.target_strategy or 'unknown'}.\n"
+        f"Keyword brief: primary={primary_terms}; secondary={secondary_terms}; area={keyword_brief.get('area', 'NA')}.\n"
+        f"Candidate domains: {allowed_domains}. Avoid: {avoid_domains}. Low-yield platforms: {low_yield}.\n"
+        f"Unprocessed fetches: {' | '.join(unprocessed) if unprocessed else 'none'}.\n"
+        f"Parsed pending results: {' | '.join(parsed_pending) if parsed_pending else 'none'}.\n"
+        f"Recent failures: {' | '.join(failures) if failures else 'none'}."
+    )
+
+
+def _tool_history_content(tool_name: str, result: dict, ctx: ToolContext) -> str:
+    """Return a token-lean tool message for model history."""
+    if "error" in result:
+        return json.dumps(
+            {
+                "tool": tool_name,
+                "error": result.get("error"),
+                "url": result.get("url"),
+                "arguments": result.get("arguments"),
+            },
+            ensure_ascii=False,
+        )
+
+    if tool_name == "suggest_targets":
+        payload = {
+            "tool": tool_name,
+            "status": result.get("status", "ok"),
+            "phase": result.get("phase"),
+            "strategy": result.get("strategy"),
+            "keyword_brief": result.get("keyword_brief"),
+            "allowed_domains": result.get("allowed_domains"),
+            "candidate_targets": [
+                {
+                    "url": target.get("url"),
+                    "domain": target.get("domain"),
+                    "source": target.get("source"),
+                }
+                for target in result.get("candidate_targets", [])[:3]
+            ],
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    if tool_name == "fetch_page":
+        return json.dumps(
+            {
+                "tool": tool_name,
+                "fetch_id": result.get("fetch_id"),
+                "url": result.get("url"),
+                "final_url": result.get("final_url"),
+                "title": result.get("title"),
+                "page_kind": result.get("page_kind"),
+                "preview": str(result.get("preview", ""))[:200],
+                "exhausted": result.get("exhausted", False),
+            },
+            ensure_ascii=False,
+        )
+
+    if tool_name == "list_links":
+        return json.dumps(
+            {
+                "tool": tool_name,
+                "count": result.get("count"),
+                "exhausted": result.get("exhausted", False),
+                "links": result.get("links", [])[:5],
+            },
+            ensure_ascii=False,
+        )
+
+    if tool_name == "parse_html":
+        return json.dumps(
+            {
+                "tool": tool_name,
+                "fields": result.get("fields"),
+                "cached": result.get("cached", False),
+            },
+            ensure_ascii=False,
+        )
+
+    if tool_name in {"save_result", "fail_url"}:
+        return json.dumps(
+            {
+                "tool": tool_name,
+                "status": result.get("status"),
+                "url": result.get("url"),
+                "reason": result.get("reason"),
+            },
+            ensure_ascii=False,
+        )
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _looks_like_fake_tool_calls(content: str) -> bool:
+    """Return True when the model printed tool-shaped prose instead of real tool calls."""
+    return bool(content and _FAKE_TOOL_CALL_PATTERN.search(content))
+
+
+def _build_fake_tool_call_correction(ctx: ToolContext) -> str:
+    """Return a narrow reminder when the model printed tool calls as prose/code blocks."""
+    return (
+        f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
+        "You must call tools directly instead of printing code blocks or pseudo-tool calls. "
+        "If profile pages are already fetched, parse them now. Otherwise continue from the current discovery page."
+    )
 
 
 def _fmt_args(args: dict) -> str:
@@ -229,6 +491,7 @@ def _should_request_follow_through(ctx: ToolContext) -> bool:
     return (
         _needs_target_suggestions(ctx)
         or _needs_target_fetch_follow_through(ctx)
+        or bool(_remaining_discovery_fetch_ids(ctx))
         or bool(_unprocessed_fetch_ids(ctx))
     )
 
@@ -281,6 +544,21 @@ def _build_follow_through_reminder(ctx: ToolContext) -> str:
             f"Outstanding pages: {summary}"
         )
 
+    if _remaining_discovery_fetch_ids(ctx):
+        discovery_pages = []
+        for fetch_id in _remaining_discovery_fetch_ids(ctx)[:2]:
+            metadata = ctx.fetch_metadata.get(fetch_id, {})
+            url = metadata.get("final_url") or metadata.get("url") or "unknown URL"
+            page_kind = metadata.get("page_kind", "unknown")
+            discovery_pages.append(
+                f"{fetch_id} ({page_kind}) {url}: call list_links again to continue from unseen candidates on this page."
+            )
+        return (
+            f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
+            "Continue from the current discovery/search pages before asking for new targets. "
+            f"Discovery pages with unseen candidates: {' '.join(discovery_pages)}"
+        )
+
     if _needs_target_fetch_follow_through(ctx):
         preview = " ".join(_candidate_preview_urls(ctx, limit=3))
         keyword_brief = ctx.keyword_brief or {}
@@ -320,44 +598,67 @@ async def _try_automatic_profile_processing(ctx: ToolContext, messages: list[dic
     if not profile_fetch_ids:
         return False
 
-    field_names = list(ctx.client_config.get("fields", {}).keys())
     processed_any = False
 
-    for fetch_id in profile_fetch_ids:
+    batch = profile_fetch_ids[:_AUTO_PROFILE_BATCH_SIZE]
+    parse_records = await asyncio.gather(
+        *[_auto_process_profile_fetch(step, fetch_id, ctx) for fetch_id in batch]
+    )
+    for fetch_id, records in zip(batch, parse_records):
+        for tool_name, args, result in records:
+            result_str = json.dumps(result, ensure_ascii=False)
+            print(f"[step {step}] → {tool_name}({_fmt_args(args)}) [auto]", flush=True)
+            print(f"[step {step}] ← {result_str[:300]} [auto]", flush=True)
+            messages.append({"role": "tool", "content": _tool_history_content(tool_name, result, ctx)})
+        processed_any = processed_any or bool(records)
+        if _lead_target_reached(ctx):
+            break
+
+        if not records:
+            continue
+
+        parse_result = records[-1][2]
+        fields = parse_result.get("fields", {})
         metadata = ctx.fetch_metadata.get(fetch_id, {})
         url = metadata.get("final_url") or metadata.get("url") or ""
-        parse_args = {"fetch_id": fetch_id, "field_names": field_names}
-        print(f"[step {step}] → parse_html({_fmt_args(parse_args)}) [auto]", flush=True)
-        parse_result = await dispatch_tool("parse_html", parse_args, ctx)
-        parse_result_str = json.dumps(parse_result, ensure_ascii=False)
-        print(f"[step {step}] ← {parse_result_str[:300]} [auto]", flush=True)
-        messages.append({"role": "tool", "content": parse_result_str})
 
-        fields = parse_result.get("fields", {})
-        name = fields.get("name") if isinstance(fields, dict) else None
-        if _looks_saveable_name(name):
-            save_args = {"url": url, "data": fields}
-            print(f"[step {step}] → save_result({_fmt_args(save_args)}) [auto]", flush=True)
-            save_result = await dispatch_tool("save_result", save_args, ctx)
-            save_result_str = json.dumps(save_result, ensure_ascii=False)
-            print(f"[step {step}] ← {save_result_str[:300]} [auto]", flush=True)
-            messages.append({"role": "tool", "content": save_result_str})
+        if _looks_saveable_name(fields.get("name") if isinstance(fields, dict) else None):
+            follow_up_name = "save_result"
+            follow_up_args = {"url": url, "data": fields}
         else:
-            fail_args = {
+            follow_up_name = "fail_url"
+            follow_up_args = {
                 "url": url,
                 "reason": "Automatic profile processing could not extract a usable person identifier.",
             }
-            print(f"[step {step}] → fail_url({_fmt_args(fail_args)}) [auto]", flush=True)
-            fail_result = await dispatch_tool("fail_url", fail_args, ctx)
-            fail_result_str = json.dumps(fail_result, ensure_ascii=False)
-            print(f"[step {step}] ← {fail_result_str[:300]} [auto]", flush=True)
-            messages.append({"role": "tool", "content": fail_result_str})
 
+        follow_up_result = await dispatch_tool(follow_up_name, follow_up_args, ctx)
+        follow_up_str = json.dumps(follow_up_result, ensure_ascii=False)
+        print(f"[step {step}] → {follow_up_name}({_fmt_args(follow_up_args)}) [auto]", flush=True)
+        print(f"[step {step}] ← {follow_up_str[:300]} [auto]", flush=True)
+        messages.append({"role": "tool", "content": _tool_history_content(follow_up_name, follow_up_result, ctx)})
         processed_any = True
         if _lead_target_reached(ctx):
             break
 
     return processed_any
+
+
+async def _auto_process_profile_fetch(
+    step: int,  # noqa: ARG001
+    fetch_id: str,
+    ctx: ToolContext,
+) -> list[tuple[str, dict, dict]]:
+    """Parse and save/fail a single fetched profile page for auto-flush."""
+    field_names = list(ctx.client_config.get("fields", {}).keys())
+    metadata = ctx.fetch_metadata.get(fetch_id, {})
+    records: list[tuple[str, dict, dict]] = []
+
+    parse_args = {"fetch_id": fetch_id, "field_names": field_names}
+    parse_result = await dispatch_tool("parse_html", parse_args, ctx)
+    records.append(("parse_html", parse_args, parse_result))
+
+    return records
 
 
 async def _auto_fail_remaining_non_actionable_pages(
@@ -386,7 +687,7 @@ async def _auto_fail_remaining_non_actionable_pages(
         fail_result = await dispatch_tool("fail_url", fail_args, ctx)
         fail_result_str = json.dumps(fail_result, ensure_ascii=False)
         print(f"[step {step}] ← {fail_result_str[:300]} [auto]", flush=True)
-        messages.append({"role": "tool", "content": fail_result_str})
+        messages.append({"role": "tool", "content": _tool_history_content("fail_url", fail_result, ctx)})
         processed_any = True
 
     return processed_any
@@ -501,6 +802,9 @@ def _needs_target_fetch_follow_through(ctx: ToolContext) -> bool:
     if _lead_target_reached(ctx):
         return False
 
+    if _remaining_discovery_fetch_ids(ctx):
+        return False
+
     return bool(_remaining_candidate_domains(ctx))
 
 
@@ -549,9 +853,32 @@ def _remaining_candidate_domains(ctx: ToolContext) -> list[str]:
         outcome = ctx.domain_outcomes.get(domain)
         if outcome and outcome.banned_for_run:
             continue
+        if _domain_on_low_yield_cooldown(domain, ctx):
+            continue
         if domain not in fetched_domains:
             remaining.append(domain)
     return remaining
+
+
+def _remaining_discovery_fetch_ids(ctx: ToolContext) -> list[str]:
+    """Return discovery pages that still have unseen candidate links."""
+    remaining: list[str] = []
+    for fetch_id, metadata in ctx.fetch_metadata.items():
+        if metadata.get("page_kind") not in {"search_results", "directory", "company_directory", "company_page"}:
+            continue
+        if fetch_id in ctx.exhausted_discovery_fetches:
+            continue
+        remaining.append(fetch_id)
+    return remaining
+
+
+def _domain_on_low_yield_cooldown(domain: str, ctx: ToolContext) -> bool:
+    """Return True when a domain maps to a run-local low-yield social platform."""
+    if domain == "linkedin.com" and "linkedin" in getattr(ctx, "low_yield_platforms", set()):
+        return True
+    if domain in {"x.com", "twitter.com"} and "x" in getattr(ctx, "low_yield_platforms", set()):
+        return True
+    return False
 
 
 def _candidate_preview_urls(ctx: ToolContext, limit: int = 3) -> list[str]:
@@ -611,8 +938,8 @@ def _follow_through_signature(ctx: ToolContext) -> tuple[int, int, int, int, str
     """Return a lightweight snapshot of actionable state for reminder budgeting."""
     return (
         len(_unprocessed_fetch_ids(ctx)),
+        len(_remaining_discovery_fetch_ids(ctx)),
         len(_remaining_candidate_domains(ctx)),
         _saved_lead_count(ctx),
-        ctx.tool_call_count,
         ctx.source_phase,
     )

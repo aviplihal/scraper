@@ -80,6 +80,12 @@ _RESTRICTION_URLS = ["/checkpoint/", "/authwall", "/challenge/", "/login-submit"
 _RESTRICTION_TEXT_CUES = ["unusual activity", "verify your identity", "security verification", "challenge"]
 _CAPTCHA_SELECTORS = ["div#captcha-internal", "iframe[title*='captcha']", "input[name='captcha']"]
 _PAUSE_HOURS = 8
+_NOT_FOUND_TEXT_CUES = [
+    "page not found",
+    "profile not found",
+    "this page doesn't exist",
+    "the page you’re looking for can’t be found",
+]
 
 
 class LinkedInAdapter(SocialAdapter):
@@ -184,6 +190,15 @@ class LinkedInAdapter(SocialAdapter):
                 pass
             await wait_reading_time(page)
             await _check_restriction(page)
+
+            if await _looks_like_missing_profile(page):
+                return SocialFetchResult(
+                    final_url=page.url,
+                    title="LinkedIn profile not found",
+                    page_kind="not_found",
+                    html="<html><body><h1>Page not found</h1></body></html>",
+                    extracted_data={},
+                )
 
             for _ in range(random.randint(2, 4)):
                 await human_scroll(page, "down")
@@ -319,6 +334,19 @@ async def _check_restriction(page: Page) -> None:
         logger.warning(message)
         await send_alert(f"⚠️ {message} Pausing platform for {_PAUSE_HOURS} hours.")
         raise RestrictionDetected(message)
+
+
+async def _looks_like_missing_profile(page: Page) -> bool:
+    """Return True when LinkedIn redirected to an unavailable or 404 profile."""
+    current_url = page.url.lower()
+    if "/404" in current_url or "/error" in current_url:
+        return True
+
+    try:
+        body_text = (await page.evaluate("document.body.innerText") or "").lower()
+    except Exception:
+        body_text = ""
+    return any(cue in body_text for cue in _NOT_FOUND_TEXT_CUES)
 
 
 # Backward-compatible alias for older references.

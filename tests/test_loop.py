@@ -10,7 +10,9 @@ from agent.loop import (
     _auto_fail_remaining_non_actionable_pages,
     _build_follow_through_reminder,
     _candidate_preview_urls,
+    _conversation_state_summary,
     _maybe_switch_to_discovery_phase,
+    _maybe_compact_messages,
     _try_automatic_profile_processing,
     run_agent_loop,
 )
@@ -124,7 +126,7 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(processed)
         self.assertEqual(writer.saved_count, 1)
-        self.assertNotIn("fetch-2", ctx.processed_fetch_ids)
+        self.assertEqual(writer.saved_rows[0]["source_url"], "https://github.com/alice-smith")
 
     def test_follow_through_reminder_includes_target_progress(self) -> None:
         writer = _DummyWriter()
@@ -250,6 +252,7 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
             "preview": "results",
         }
         ctx.processed_fetch_ids.add("fetch-1")
+        ctx.exhausted_discovery_fetches.add("fetch-1")
 
         reminder = _build_follow_through_reminder(ctx)
 
@@ -433,6 +436,115 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.calls, 1)
         self.assertEqual(writer.saved_count, 1)
         self.assertIn("Reached lead target", result["stop_reason"])
+
+    async def test_run_tracks_ollama_prompt_and_completion_tokens(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find engineers",
+                "job_title": "Engineer",
+                "area": "NA",
+                "website": "https://github.com",
+                "min_leads": 1,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        responses = [
+            SimpleNamespace(
+                prompt_eval_count=123,
+                eval_count=45,
+                message=SimpleNamespace(content="", tool_calls=[]),
+            )
+        ]
+
+        class _FakeClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def chat(self, **_: object) -> SimpleNamespace:
+                response = responses[self.calls]
+                self.calls += 1
+                return response
+
+        fake_client = _FakeClient()
+
+        with patch("agent.loop.ollama.AsyncClient", return_value=fake_client):
+            result = await run_agent_loop(ctx.client_config, "web", ctx)
+
+        self.assertEqual(result["prompt_tokens"], 123)
+        self.assertEqual(result["completion_tokens"], 45)
+        self.assertEqual(result["total_tokens"], 168)
+
+    def test_compactor_reduces_history_and_records_summary(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 3,
+            },
+            sheets_writer=writer,
+            source_mode="all",
+            source_phase="pass1",
+        )
+        ctx.target_strategy = "technical_profiles"
+        ctx.keyword_brief = {
+            "primary_terms": ["Senior Software Engineer"],
+            "secondary_terms": ["Software Engineer"],
+            "area": "San Francisco Bay Area",
+        }
+        ctx.candidate_domains = ["github.com", "linkedin.com", "x.com"]
+        ctx.fetch_metadata["fetch-1"] = {
+            "url": "https://github.com/alice",
+            "final_url": "https://github.com/alice",
+            "page_kind": "profile",
+            "title": "Alice",
+        }
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "job"},
+        ] + [{"role": "tool", "content": f"msg-{idx}"} for idx in range(14)]
+        run_result = {"last_prompt_tokens": 3000, "compactions": 0}
+
+        _maybe_compact_messages(messages, ctx, run_result)
+
+        self.assertLess(len(messages), 17)
+        self.assertEqual(run_result["compactions"], 1)
+        self.assertIn("Context summary for the ongoing lead scrape", messages[2]["content"])
+        self.assertIn("Candidate domains: github.com, linkedin.com, x.com", _conversation_state_summary(ctx))
+
+    def test_follow_through_reminder_prefers_current_discovery_pages(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 3,
+            },
+            sheets_writer=writer,
+            source_mode="all",
+        )
+        ctx.suggest_targets_called = True
+        ctx.fetch_metadata["fetch-search"] = {
+            "url": "https://github.com/search?q=engineer&type=users",
+            "final_url": "https://github.com/search?q=engineer&type=users",
+            "page_kind": "search_results",
+            "title": "Search",
+        }
+
+        reminder = _build_follow_through_reminder(ctx)
+
+        self.assertIn("You have fetched pages that are still unprocessed", reminder)
+        self.assertIn("call list_links on this page", reminder)
 
 
 if __name__ == "__main__":

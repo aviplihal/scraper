@@ -4,6 +4,7 @@ Each source mode (web, human_emulator, all) wires up the appropriate
 browser and emulator instances before running the agent loop.
 """
 
+import asyncio
 import logging
 from urllib.parse import urlparse
 
@@ -63,14 +64,29 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
         source_phase     = "pass1" if source_state.has_pass1_sources_for_mode(source) else "discovery",
     )
 
+    run_result = _noop_run_result("Run exited before the agent started.")
+    interrupted = False
     try:
         if source == "all":
             await _preflight_social_platforms(config, ctx)
         run_result = await run_agent_loop(config, source, ctx)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        interrupted = True
+        run_result = {
+            **run_result,
+            "status": "interrupted",
+            "stop_reason": "Run interrupted by user.",
+        }
     finally:
-        await scraper.close()
+        try:
+            await scraper.close()
+        except Exception as exc:  # pragma: no cover - defensive cleanup
+            logger.warning("Error while closing scraper browser: %s", exc)
         if emulator_browser:
-            await emulator_browser.close()
+            try:
+                await emulator_browser.close()
+            except Exception as exc:  # pragma: no cover - defensive cleanup
+                logger.warning("Error while closing emulator browser: %s", exc)
 
     if ctx.source_state is not None:
         ctx.source_state.finalize_run({
@@ -79,6 +95,8 @@ async def _run_web(config: dict, source: str, writer: StorageWriter) -> None:
         })
 
     _print_run_summary(config, source, writer, ctx, run_result)
+    if interrupted:
+        raise KeyboardInterrupt
 
 
 async def _run_emulator(config: dict, writer: StorageWriter) -> None:
@@ -102,6 +120,8 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
         source_phase     = "pass1" if source_state.has_pass1_sources_for_mode("human_emulator") else "discovery",
     )
 
+    run_result = _noop_run_result("Run exited before the agent started.")
+    interrupted = False
     try:
         if not platforms:
             print("[runner] No social platforms are enabled for this client. Add 'social_platforms' to the config.")
@@ -119,8 +139,18 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
         # Run the agent loop — it will call fetch_page with social-media URLs
         # which are auto-routed to the human emulator via the tool dispatcher
         run_result = await run_agent_loop(config, "human_emulator", ctx)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        interrupted = True
+        run_result = {
+            **run_result,
+            "status": "interrupted",
+            "stop_reason": "Run interrupted by user.",
+        }
     finally:
-        await emulator_browser.close()
+        try:
+            await emulator_browser.close()
+        except Exception as exc:  # pragma: no cover - defensive cleanup
+            logger.warning("Error while closing emulator browser: %s", exc)
 
     if ctx.source_state is not None:
         ctx.source_state.finalize_run({
@@ -129,6 +159,8 @@ async def _run_emulator(config: dict, writer: StorageWriter) -> None:
         })
 
     _print_run_summary(config, "human_emulator", writer, ctx, run_result)
+    if interrupted:
+        raise KeyboardInterrupt
 
 
 def _print_run_summary(
@@ -151,6 +183,14 @@ def _print_run_summary(
     print(f"Lead target: {lead_target}")
     print(f"Steps run  : {run_result['steps_run']}")
     print(f"Tool calls : {ctx.tool_call_count}")
+    print(
+        "Tokens used: "
+        f"prompt={run_result.get('prompt_tokens', 0)}, "
+        f"completion={run_result.get('completion_tokens', 0)}, "
+        f"total={run_result.get('total_tokens', 0)}"
+    )
+    print(f"Max prompt tokens: {run_result.get('max_prompt_tokens', 0)}")
+    print(f"Compactions: {run_result.get('compactions', 0)}")
     print(f"Pages tried: {ctx.fetch_count}")
     print(f"Fetch errs : {ctx.fetch_error_count}")
     print(f"Viable saved: {writer.saved_count}")
@@ -290,4 +330,9 @@ def _noop_run_result(stop_reason: str) -> dict[str, object]:
         "status": "done",
         "steps_run": 0,
         "stop_reason": stop_reason,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "max_prompt_tokens": 0,
+        "compactions": 0,
     }

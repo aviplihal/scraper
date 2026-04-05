@@ -7,7 +7,14 @@ from unittest.mock import patch
 
 from human_emulator.social import SocialFetchResult
 from source_state import SourceState
-from tools.registry import DomainOutcome, ToolContext, _record_domain_failure, _record_fetch_outcome, dispatch_tool
+from tools.registry import (
+    DomainOutcome,
+    ToolContext,
+    _normalize_url,
+    _record_domain_failure,
+    _record_fetch_outcome,
+    dispatch_tool,
+)
 
 
 class _DummyWriter:
@@ -81,6 +88,28 @@ class _FakeEmulatorState:
 
 
 class RegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repeated_suggest_targets_same_phase_returns_unchanged_brief(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 1,
+            },
+            sheets_writer=writer,
+            source_mode="all",
+        )
+
+        first = await dispatch_tool("suggest_targets", {"limit": 4}, ctx)
+        second = await dispatch_tool("suggest_targets", {"limit": 4}, ctx)
+
+        self.assertEqual(first["strategy"], "technical_profiles")
+        self.assertEqual(second["status"], "unchanged")
+        self.assertEqual(second["phase"], "pass1")
+
     async def test_suggest_targets_returns_curated_leadership_targets(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
@@ -281,6 +310,41 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["count"], 1)
         self.assertEqual(result["links"][0]["url"], "https://github.com/alice")
+
+    async def test_list_links_returns_unseen_candidates_then_exhausts(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "https://github.com", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.page_cache["fetch-1"] = """
+        <html><body>
+          <a href="https://github.com/alice">Alice</a>
+          <a href="https://github.com/bob">Bob</a>
+          <a href="https://github.com/carla">Carla</a>
+        </body></html>
+        """
+        ctx.fetch_metadata["fetch-1"] = {
+            "url": "https://github.com/search?q=engineer&type=users",
+            "final_url": "https://github.com/search?q=engineer&type=users",
+            "title": "User search results · GitHub",
+            "page_kind": "search_results",
+            "preview": "results",
+        }
+
+        first = await dispatch_tool("list_links", {"fetch_id": "fetch-1", "limit": 2}, ctx)
+        second = await dispatch_tool("list_links", {"fetch_id": "fetch-1", "limit": 2}, ctx)
+
+        self.assertEqual(len(first["links"]), 2)
+        self.assertEqual(len(second["links"]), 1)
+        self.assertTrue(second["exhausted"])
+
+    def test_social_profile_urls_canonicalize_mini_profile_variants(self) -> None:
+        self.assertEqual(
+            _normalize_url("https://www.linkedin.com/in/test-person?miniProfileUrn=abc"),
+            _normalize_url("https://www.linkedin.com/in/test-person/"),
+        )
 
     async def test_social_url_routes_through_matching_adapter(self) -> None:
         writer = _DummyWriter()
@@ -563,6 +627,50 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
                 "social_media": profile_url,
             },
         )
+
+    async def test_parse_html_blank_social_profile_becomes_terminal(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "NA",
+                "min_leads": 1,
+                "fields": {
+                    "name": "Full name",
+                    "job_title": "Title",
+                    "company": "Company",
+                    "email": "Email",
+                    "phone": "Phone",
+                    "social_media": "Profile URL",
+                },
+            },
+            sheets_writer=writer,
+            source_mode="all",
+        )
+        profile_url = "https://www.linkedin.com/in/test-person"
+        ctx.page_cache["fetch-social-blank"] = "<html><body></body></html>"
+        ctx.fetch_metadata["fetch-social-blank"] = {
+            "url": profile_url,
+            "final_url": profile_url,
+            "title": "LinkedIn profile",
+            "page_kind": "profile",
+            "preview": "",
+            "platform": "linkedin",
+            "extracted_data": {},
+        }
+
+        result = await dispatch_tool(
+            "parse_html",
+            {
+                "fetch_id": "fetch-social-blank",
+                "field_names": ["name", "job_title", "company", "email", "phone", "social_media"],
+            },
+            ctx,
+        )
+
+        self.assertIsNone(result["fields"]["name"])
+        self.assertEqual(ctx.fetch_metadata["fetch-social-blank"]["page_kind"], "not_found")
+        self.assertEqual(ctx.terminal_url_outcomes[_normalize_url(profile_url)], "blank_profile")
 
     async def test_save_result_accepts_flat_arguments_with_fetch_id(self) -> None:
         writer = _DummyWriter()

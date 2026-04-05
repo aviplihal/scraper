@@ -13,13 +13,14 @@ A ToolContext object is passed to every tool so they can share state
 without globals.
 """
 
+import asyncio
 import json
 import logging
 import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from human_emulator.platforms import adapter_for_url
 from human_emulator.social import RestrictionDetected, build_profile_html
@@ -155,6 +156,19 @@ class ToolContext:
     discovery_source_samples: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     current_run_saved_leads: list[dict[str, Any]] = field(default_factory=list)
     social_profile_hints: dict[str, dict[str, Any]] = field(default_factory=dict)
+    terminal_url_outcomes: dict[str, str] = field(default_factory=dict)
+    discovery_seen_links: dict[str, set[str]] = field(default_factory=dict)
+    exhausted_discovery_fetches: set[str] = field(default_factory=set)
+    fetch_parent_seeds: dict[str, str] = field(default_factory=dict)
+    social_blank_seed_counts: dict[str, int] = field(default_factory=dict)
+    social_platform_failures: dict[str, int] = field(default_factory=dict)
+    social_platform_saves: dict[str, int] = field(default_factory=dict)
+    low_yield_platforms: set[str] = field(default_factory=set)
+    parse_attempt_counts: dict[str, int] = field(default_factory=dict)
+    last_suggest_targets_signature: tuple[str, int, int, int, int] | None = None
+    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    social_platform_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    source_sample_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +423,28 @@ async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> di
 
 def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
     """Return a keyword brief and candidate targets for the current run."""
+    signature = (
+        ctx.source_phase,
+        _saved_count(ctx),
+        len(ctx.failed_urls),
+        len(ctx.terminal_url_outcomes),
+        len(ctx.low_yield_platforms),
+    )
+    if (
+        ctx.suggest_targets_called
+        and ctx.last_suggest_targets_signature == signature
+        and ctx.suggested_targets
+    ):
+        return {
+            "status": "unchanged",
+            "phase": ctx.source_phase,
+            "strategy": ctx.target_strategy or "unknown",
+            "keyword_brief": dict(ctx.keyword_brief),
+            "allowed_domains": list(ctx.candidate_domains or sorted(ctx.allowed_domains)),
+            "candidate_targets": list(ctx.suggested_targets[:3]),
+            "message": "Target brief unchanged in the current source phase.",
+        }
+
     result = suggest_targets(
         ctx.client_config,
         ctx.source_mode,
@@ -446,6 +482,7 @@ def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
         for domain in result.get("avoid_domains", [])
         if str(domain).strip()
     ]
+    ctx.last_suggest_targets_signature = signature
     return result
 
 
@@ -454,10 +491,20 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
     normalized_url = _normalize_url(url)
     domain = _domain_for_url(url)
 
+    terminal_outcome = _terminal_outcome_for_url(url, ctx)
+    if terminal_outcome:
+        ctx.fetch_error_count += 1
+        return {
+            "error": f"URL is exhausted for this run due to a previous terminal outcome: {terminal_outcome}.",
+            "url": url,
+        }
+
     if normalized_url in ctx.url_to_fetch_id:
         fetch_id = ctx.url_to_fetch_id[normalized_url]
         cached = ctx.fetch_metadata[fetch_id].copy()
         cached["fetch_id"] = fetch_id
+        if fetch_id in ctx.exhausted_discovery_fetches:
+            cached["exhausted"] = True
         return cached
 
     if _is_social_media(url):
@@ -472,6 +519,16 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
         if broad_mode_rejection:
             ctx.fetch_error_count += 1
             return {"error": broad_mode_rejection, "url": url}
+
+        if _is_low_yield_platform(url, ctx) and _has_alternative_allowed_domain(url, ctx):
+            ctx.fetch_error_count += 1
+            return {
+                "error": (
+                    f"Social platform '{domain}' is on a low-yield cooldown for this run. "
+                    "Use another candidate domain before retrying it."
+                ),
+                "url": url,
+            }
 
         if ctx.client_config.get("website", "NA").upper() == "NA" and url not in ctx._logged_sites_chosen:
             ctx._logged_sites_chosen.append(url)
@@ -518,11 +575,7 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
         ctx.fetch_error_count += 1
         return {"error": str(exc), "url": url}
 
-    ctx.fetch_count += 1
-    ctx.domain_fetch_counts[domain] = ctx.domain_fetch_counts.get(domain, 0) + 1
-
     fetch_id = str(uuid.uuid4())
-    ctx.page_cache[fetch_id] = fetch_result.html
     page_info = classify_page(url, fetch_result.final_url, fetch_result.html)
     preview = build_preview(fetch_result.html)
     metadata = {
@@ -532,11 +585,18 @@ async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -
         "page_kind": page_info.page_kind,
         "preview": preview,
     }
-    ctx.fetch_metadata[fetch_id] = metadata
-    ctx.url_to_fetch_id[normalized_url] = fetch_id
-    ctx.url_to_fetch_id[_normalize_url(page_info.final_url)] = fetch_id
-    ctx.visited_urls.add(_normalize_url(page_info.final_url))
-    ctx.visited_urls.add(normalized_url)
+    async with ctx.state_lock:
+        ctx.fetch_count += 1
+        ctx.domain_fetch_counts[domain] = ctx.domain_fetch_counts.get(domain, 0) + 1
+        ctx.page_cache[fetch_id] = fetch_result.html
+        ctx.fetch_metadata[fetch_id] = metadata
+        ctx.url_to_fetch_id[normalized_url] = fetch_id
+        ctx.url_to_fetch_id[_normalize_url(page_info.final_url)] = fetch_id
+        ctx.visited_urls.add(_normalize_url(page_info.final_url))
+        ctx.visited_urls.add(normalized_url)
+        if page_info.page_kind in {"blocked", "not_found"}:
+            _mark_terminal_url(page_info.final_url, page_info.page_kind, ctx)
+            _mark_terminal_url(url, page_info.page_kind, ctx)
     _record_fetch_outcome(fetch_id, domain, page_info.page_kind, ctx)
     _record_source_fetch(page_info.final_url, ctx)
 
@@ -591,7 +651,8 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
         ctx.social_adapters[platform] = adapter
 
     try:
-        fetch_result = await adapter.fetch(url)
+        async with _platform_lock(ctx, platform):
+            fetch_result = await adapter.fetch(url)
     except RestrictionDetected as exc:
         ctx.emulator_state.record_restriction(platform)
         ctx.emulator_state.set_pause_hours(platform, hours=8, reason=str(exc))
@@ -607,11 +668,8 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
             "url": url,
         }
 
-    ctx.fetch_count += 1
     domain = _domain_for_url(fetch_result.final_url or url)
-    ctx.domain_fetch_counts[domain] = ctx.domain_fetch_counts.get(domain, 0) + 1
     fetch_id = str(uuid.uuid4())
-    ctx.page_cache[fetch_id] = fetch_result.html
     preview = build_preview(fetch_result.html)
     metadata = {
         "url": url,
@@ -622,16 +680,26 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
         "platform": platform,
         "extracted_data": fetch_result.extracted_data,
     }
-    ctx.fetch_metadata[fetch_id] = metadata
-    ctx.url_to_fetch_id[_normalize_url(url)] = fetch_id
-    ctx.url_to_fetch_id[_normalize_url(fetch_result.final_url or url)] = fetch_id
-    ctx.visited_urls.add(_normalize_url(url))
-    ctx.visited_urls.add(_normalize_url(fetch_result.final_url or url))
+    async with ctx.state_lock:
+        ctx.fetch_count += 1
+        ctx.domain_fetch_counts[domain] = ctx.domain_fetch_counts.get(domain, 0) + 1
+        ctx.page_cache[fetch_id] = fetch_result.html
+        ctx.fetch_metadata[fetch_id] = metadata
+        ctx.url_to_fetch_id[_normalize_url(url)] = fetch_id
+        ctx.url_to_fetch_id[_normalize_url(fetch_result.final_url or url)] = fetch_id
+        ctx.visited_urls.add(_normalize_url(url))
+        ctx.visited_urls.add(_normalize_url(fetch_result.final_url or url))
+        if fetch_result.page_kind in {"blocked", "not_found"}:
+            _mark_terminal_url(fetch_result.final_url or url, fetch_result.page_kind, ctx)
+            _mark_terminal_url(url, fetch_result.page_kind, ctx)
     _record_fetch_outcome(fetch_id, domain, fetch_result.page_kind, ctx)
     _record_source_fetch(fetch_result.final_url or url, ctx)
 
     if fetch_result.page_kind == "profile":
         ctx.emulator_state.mark_visited(fetch_result.final_url or url, platform=platform)
+        seed_fetch_id = ctx.fetch_parent_seeds.get(_normalize_url(url), "")
+        if seed_fetch_id:
+            ctx.fetch_parent_seeds[fetch_id] = seed_fetch_id
 
     if fetch_result.extracted_data:
         if fetch_result.page_kind in {"search_results", "directory"}:
@@ -645,12 +713,14 @@ async def _fetch_social_media(url: str, ctx: ToolContext) -> dict:
             for item in fetch_result.extracted_data.get("results", []):
                 if not isinstance(item, dict) or not item.get("url"):
                     continue
-                ctx.social_profile_hints[_normalize_url(str(item["url"]))] = {
+                candidate_url = _normalize_url(str(item["url"]))
+                ctx.social_profile_hints[candidate_url] = {
                     "name": item.get("name"),
                     "job_title": item.get("headline"),
                     "company": item.get("company"),
                     "social_media": item.get("url"),
                 }
+                ctx.fetch_parent_seeds[candidate_url] = fetch_id
         else:
             hint = ctx.social_profile_hints.get(_normalize_url(fetch_result.final_url or url), {})
             if isinstance(fetch_result.extracted_data, dict) and hint:
@@ -689,16 +759,41 @@ def _tool_list_links(
         }
 
     ctx.processed_fetch_ids.add(fetch_id)
+    if fetch_id in ctx.exhausted_discovery_fetches:
+        return {"links": [], "count": 0, "exhausted": True}
+
     base_url = metadata.get("final_url") or metadata.get("url")
     effective_same_domain = same_domain_only or bool(ctx.target_domain)
     links = extract_links(
         html,
         base_url,
         selector=selector,
-        limit=max(1, min(int(limit), 50)),
+        limit=100,
         same_domain_only=effective_same_domain,
     )
-    return {"links": links, "count": len(links)}
+    seen_urls = ctx.discovery_seen_links.setdefault(fetch_id, set())
+    eligible_links: list[dict[str, Any]] = []
+    for item in links:
+        candidate_url = _normalize_url(str(item.get("url", "")))
+        if not candidate_url:
+            continue
+        if candidate_url in seen_urls:
+            continue
+        if candidate_url in ctx.visited_urls or candidate_url in ctx.terminal_url_outcomes:
+            seen_urls.add(candidate_url)
+            continue
+        eligible_links.append({**item, "url": candidate_url})
+
+    unseen_links = eligible_links[: max(1, min(int(limit), 50))]
+    for item in unseen_links:
+        seen_urls.add(str(item.get("url", "")))
+
+    remaining_candidates = eligible_links[len(unseen_links) :]
+    exhausted = len(eligible_links) < 2 or not remaining_candidates
+    if exhausted:
+        ctx.exhausted_discovery_fetches.add(fetch_id)
+
+    return {"links": unseen_links, "count": len(unseen_links), "exhausted": exhausted}
 
 
 def _tool_parse_html(
@@ -719,13 +814,21 @@ def _tool_parse_html(
                 f"fetch_id '{fetch_id}' is classified as '{page_kind}'. Use list_links or fail_url instead."
             )
         }
+    if ctx.parse_attempt_counts.get(fetch_id, 0) >= 1 and fetch_id in ctx.parsed_results:
+        return {"fields": ctx.parsed_results[fetch_id], "cached": True}
     ctx.processed_fetch_ids.add(fetch_id)
     selector_map = fields or _selector_map_for_fetch(fetch_id, field_names, ctx)
     if not selector_map:
         return {"error": "No extractable field selectors available for this page."}
     result = parse_fields(html, selector_map)
     result = _postprocess_extracted_fields(fetch_id, result, field_names, ctx)
+    ctx.parse_attempt_counts[fetch_id] = ctx.parse_attempt_counts.get(fetch_id, 0) + 1
     ctx.parsed_results[fetch_id] = result
+    final_url = metadata.get("final_url") or metadata.get("url") or ""
+    if _is_blank_social_profile_data(final_url, result):
+        metadata["page_kind"] = "not_found"
+        _mark_terminal_url(final_url, "blank_profile", ctx)
+        _record_social_blank_profile(final_url, ctx)
     logger.debug("parse_html: %s → %s", fetch_id, result)
     return {"fields": result}
 
@@ -734,8 +837,10 @@ async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
     source_stats = _source_stats_for_url(url, ctx)
     viable, reason = _is_minimally_viable_lead(data, url)
     if not viable:
-        ctx.rejected_weak_count += 1
-        source_stats.rejected_count += 1
+        async with ctx.state_lock:
+            ctx.rejected_weak_count += 1
+            source_stats.rejected_count += 1
+            _mark_terminal_url(url, "rejected", ctx)
         logger.info("Rejected weak lead: %s — %s", url, reason)
         print(f"  • Weak lead rejected: {data.get('name') or url} ({reason})", flush=True)
         return {"status": "rejected", "url": url, "reason": reason}
@@ -749,12 +854,21 @@ async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
     try:
         status = await ctx.sheets_writer.append_row(url, data)
         if status == "saved":
-            _record_domain_save(url, ctx)
-            source_stats.saved_count += 1
-            _record_saved_lead(url, data, source_status, source_stats.family, ctx)
+            async with ctx.state_lock:
+                _record_domain_save(url, ctx)
+                source_stats.saved_count += 1
+                _record_saved_lead(url, data, source_status, source_stats.family, ctx)
+                _mark_terminal_url(url, "saved", ctx)
+                social_domain = _domain_for_url(url)
+                if social_domain == "linkedin.com":
+                    ctx.social_platform_saves["linkedin"] = ctx.social_platform_saves.get("linkedin", 0) + 1
+                elif social_domain in {"x.com", "twitter.com"}:
+                    ctx.social_platform_saves["x"] = ctx.social_platform_saves.get("x", 0) + 1
             print(f"  ✓ Saved: {data.get('name') or url}", flush=True)
         else:
-            source_stats.duplicate_count += 1
+            async with ctx.state_lock:
+                source_stats.duplicate_count += 1
+                _mark_terminal_url(url, "duplicate", ctx)
             print(f"  • Duplicate skipped: {data.get('name') or url}", flush=True)
         return {"status": status, "url": url}
     except Exception as exc:
@@ -766,9 +880,10 @@ def _tool_fail_url(url: str, reason: str, ctx: ToolContext) -> dict:
     logger.info("fail_url: %s — %s", url, reason)
     ctx.failed_url_flag = True
     ctx.failed_urls.append({"url": url, "reason": reason})
-    fetch_id = ctx.url_to_fetch_id.get(_normalize_url(url))
+    fetch_id = _lookup_fetch_id(url, ctx)
     if fetch_id:
         ctx.processed_fetch_ids.add(fetch_id)
+    _mark_terminal_url(url, reason, ctx)
     _record_domain_failure(url, reason, ctx)
     return {"status": "failed", "url": url, "reason": reason}
 
@@ -777,8 +892,43 @@ def _normalize_url(url: str) -> str:
     parsed = urlparse(url)
     if not parsed.scheme and parsed.path:
         parsed = urlparse(f"https://{url}")
-    normalized = parsed._replace(fragment="")
-    return normalized.geturl()
+    host = parsed.netloc.lower().split(":", 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    filtered_pairs = []
+    for key, value in query_pairs:
+        key_lower = key.lower()
+        if host == "linkedin.com" and key_lower in {
+            "miniprofileurn",
+            "trk",
+            "trkinfo",
+            "trackingid",
+            "originalsubdomain",
+            "lipi",
+            "midtoken",
+            "midsig",
+            "sid",
+        }:
+            continue
+        if host in {"x.com", "twitter.com"} and key_lower in {
+            "s",
+            "t",
+            "ref_src",
+            "ref_url",
+            "cn",
+        }:
+            continue
+        filtered_pairs.append((key, value))
+
+    query = urlencode(filtered_pairs, doseq=True)
+    normalized = parsed._replace(netloc=host, path=path, query=query, fragment="")
+    return urlunparse(normalized)
 
 
 def _domain_for_url(url: str) -> str:
@@ -786,6 +936,104 @@ def _domain_for_url(url: str) -> str:
     if not parsed.scheme and parsed.path:
         parsed = urlparse(f"https://{url}")
     return parsed.netloc.lower().split(":", 1)[0].removeprefix("www.")
+
+
+def _platform_lock(ctx: ToolContext, platform: str) -> asyncio.Lock:
+    """Return the per-platform async lock used to serialize social actions."""
+    if platform not in ctx.social_platform_locks:
+        ctx.social_platform_locks[platform] = asyncio.Lock()
+    return ctx.social_platform_locks[platform]
+
+
+def _source_sample_lock(ctx: ToolContext, source_key_value: str) -> asyncio.Lock:
+    """Return the per-source async lock used for discovered-source sampling."""
+    if source_key_value not in ctx.source_sample_locks:
+        ctx.source_sample_locks[source_key_value] = asyncio.Lock()
+    return ctx.source_sample_locks[source_key_value]
+
+
+def _mark_terminal_url(url: str, outcome: str, ctx: ToolContext) -> None:
+    """Record a URL as terminal for this run so it is not retried endlessly."""
+    normalized_url = _normalize_url(url)
+    ctx.terminal_url_outcomes[normalized_url] = outcome
+
+
+def _terminal_outcome_for_url(url: str, ctx: ToolContext) -> str | None:
+    """Return the run-local terminal outcome for a URL, if any."""
+    return ctx.terminal_url_outcomes.get(_normalize_url(url))
+
+
+def _lookup_fetch_id(url: str, ctx: ToolContext) -> str:
+    """Resolve a fetch_id from a URL, tolerating older unnormalized cache keys."""
+    normalized_url = _normalize_url(url)
+    fetch_id = ctx.url_to_fetch_id.get(normalized_url)
+    if fetch_id:
+        return fetch_id
+    fetch_id = ctx.url_to_fetch_id.get(url)
+    if fetch_id:
+        return fetch_id
+    for candidate_fetch_id, metadata in ctx.fetch_metadata.items():
+        metadata_urls = {
+            _normalize_url(str(metadata.get("url") or "")),
+            _normalize_url(str(metadata.get("final_url") or "")),
+        }
+        if normalized_url in metadata_urls:
+            return candidate_fetch_id
+    return ""
+
+
+def _search_seed_for_url(url: str, ctx: ToolContext) -> str:
+    """Return the discovery/search seed that produced a URL when known."""
+    fetch_id = _lookup_fetch_id(url, ctx)
+    if not fetch_id:
+        return ""
+    return ctx.fetch_parent_seeds.get(fetch_id, "")
+
+
+def _record_social_blank_profile(url: str, ctx: ToolContext) -> None:
+    """Track blank/low-yield social profiles by seed and platform."""
+    domain = _domain_for_url(url)
+    if domain not in {"linkedin.com", "x.com", "twitter.com"}:
+        return
+
+    platform = "x" if domain in {"x.com", "twitter.com"} else "linkedin"
+    seed_fetch_id = _search_seed_for_url(url, ctx)
+    if seed_fetch_id:
+        ctx.social_blank_seed_counts[seed_fetch_id] = ctx.social_blank_seed_counts.get(seed_fetch_id, 0) + 1
+        if ctx.social_blank_seed_counts[seed_fetch_id] >= 2:
+            ctx.exhausted_discovery_fetches.add(seed_fetch_id)
+
+    ctx.social_platform_failures[platform] = ctx.social_platform_failures.get(platform, 0) + 1
+    if ctx.social_platform_saves.get(platform, 0) == 0 and ctx.social_platform_failures[platform] >= 3:
+        ctx.low_yield_platforms.add(platform)
+
+
+def _is_low_yield_platform(url: str, ctx: ToolContext) -> bool:
+    """Return True when a social platform is on run-local low-yield cooldown."""
+    domain = _domain_for_url(url)
+    if domain == "linkedin.com":
+        return "linkedin" in ctx.low_yield_platforms
+    if domain in {"x.com", "twitter.com"}:
+        return "x" in ctx.low_yield_platforms
+    return False
+
+
+def _saved_count(ctx: ToolContext) -> int:
+    """Return the run-local viable saved count from the active writer."""
+    return int(getattr(ctx.sheets_writer, "saved_count", 0))
+
+
+def _has_alternative_allowed_domain(url: str, ctx: ToolContext) -> bool:
+    """Return True when another allowed candidate domain remains available this run."""
+    current_domain = _domain_for_url(url)
+    for domain in ctx.candidate_domains or sorted(ctx.allowed_domains):
+        if domain == current_domain:
+            continue
+        outcome = ctx.domain_outcomes.get(domain)
+        if outcome and outcome.banned_for_run:
+            continue
+        return True
+    return False
 
 
 def _same_or_subdomain(host: str, target_host: str) -> bool:
@@ -926,6 +1174,8 @@ def _record_domain_failure(url: str, reason: str, ctx: ToolContext) -> None:
     else:
         outcome.irrelevant_count += 1
         outcome.last_reason = reason
+    if _domain_for_url(url) in {"linkedin.com", "x.com", "twitter.com"}:
+        _record_social_blank_profile(url, ctx)
     if fetch_id:
         ctx.accounted_fetch_ids.add(fetch_id)
     _maybe_ban_domain(domain, ctx)
@@ -1012,73 +1262,74 @@ async def _sample_discovered_source(
     """Hold newly discovered-source leads until the source is quality-gated."""
     kind, identifier = infer_source_identity(url)
     key = source_key(kind, identifier)
-    family = source_stats.family or infer_source_family(kind, identifier)
-    sample_bucket = ctx.discovery_source_samples.setdefault(key, [])
-    if any(existing["url"] == url for existing in sample_bucket):
-        return {"status": "sampled", "url": url, "sample_count": len(sample_bucket), "required_samples": 3}
+    async with _source_sample_lock(ctx, key):
+        family = source_stats.family or infer_source_family(kind, identifier)
+        sample_bucket = ctx.discovery_source_samples.setdefault(key, [])
+        if any(existing["url"] == url for existing in sample_bucket):
+            return {"status": "sampled", "url": url, "sample_count": len(sample_bucket), "required_samples": 3}
 
-    sample_bucket.append({"url": url, "data": dict(data)})
-    if len(sample_bucket) < 3:
-        print(
-            f"  • Sampled discovered source lead {len(sample_bucket)}/3: {data.get('name') or url}",
-            flush=True,
-        )
-        return {"status": "sampled", "url": url, "sample_count": len(sample_bucket), "required_samples": 3}
+        sample_bucket.append({"url": url, "data": dict(data)})
+        if len(sample_bucket) < 3:
+            print(
+                f"  • Sampled discovered source lead {len(sample_bucket)}/3: {data.get('name') or url}",
+                flush=True,
+            )
+            return {"status": "sampled", "url": url, "sample_count": len(sample_bucket), "required_samples": 3}
 
-    baseline = _baseline_leads(ctx, limit=3)
-    source_score, lead_scores = _score_candidate_source(sample_bucket, source_stats, ctx)
-    baseline_score = _baseline_score(baseline, ctx)
-    outcome = _classify_candidate_source(source_score, baseline_score, ctx, exhausted=False)
+        baseline = _baseline_leads(ctx, limit=3)
+        source_score, lead_scores = _score_candidate_source(sample_bucket, source_stats, ctx)
+        baseline_score = _baseline_score(baseline, ctx)
+        outcome = _classify_candidate_source(source_score, baseline_score, ctx, exhausted=False)
 
-    if outcome == "approved":
-        ctx.source_state.promote_approved(kind, identifier, family, source_score)
-        await _flush_sampled_leads(sample_bucket, "approved", family, ctx)
+        if outcome == "approved":
+            ctx.source_state.promote_approved(kind, identifier, family, source_score)
+            await _flush_sampled_leads(sample_bucket, "approved", family, ctx)
+            ctx.discovery_source_samples.pop(key, None)
+            return {
+                "status": "approved_source",
+                "url": url,
+                "source": identifier,
+                "score": source_score,
+                "lead_scores": lead_scores,
+            }
+
+        if outcome == "temporary_seed":
+            ctx.source_state.promote_temporary_seed(kind, identifier, family, source_score)
+            await _flush_sampled_leads(sample_bucket, "temporary_seed", family, ctx)
+            ctx.discovery_source_samples.pop(key, None)
+            return {
+                "status": "temporary_seed",
+                "url": url,
+                "source": identifier,
+                "score": source_score,
+                "lead_scores": lead_scores,
+            }
+
+        if outcome == "pending_review":
+            ctx.source_state.queue_for_review(
+                kind,
+                identifier,
+                family,
+                source_score,
+                [item["data"] | {"source_url": item["url"]} for item in sample_bucket],
+                baseline,
+            )
+            ctx.discovery_source_samples.pop(key, None)
+            return {
+                "status": "pending_review",
+                "url": url,
+                "source": identifier,
+                "score": source_score,
+            }
+
+        ctx.source_state.reject_source(kind, identifier, family, source_score)
         ctx.discovery_source_samples.pop(key, None)
         return {
-            "status": "approved_source",
+            "status": "rejected_source",
             "url": url,
             "source": identifier,
             "score": source_score,
-            "lead_scores": lead_scores,
         }
-
-    if outcome == "temporary_seed":
-        ctx.source_state.promote_temporary_seed(kind, identifier, family, source_score)
-        await _flush_sampled_leads(sample_bucket, "temporary_seed", family, ctx)
-        ctx.discovery_source_samples.pop(key, None)
-        return {
-            "status": "temporary_seed",
-            "url": url,
-            "source": identifier,
-            "score": source_score,
-            "lead_scores": lead_scores,
-        }
-
-    if outcome == "pending_review":
-        ctx.source_state.queue_for_review(
-            kind,
-            identifier,
-            family,
-            source_score,
-            [item["data"] | {"source_url": item["url"]} for item in sample_bucket],
-            baseline,
-        )
-        ctx.discovery_source_samples.pop(key, None)
-        return {
-            "status": "pending_review",
-            "url": url,
-            "source": identifier,
-            "score": source_score,
-        }
-
-    ctx.source_state.reject_source(kind, identifier, family, source_score)
-    ctx.discovery_source_samples.pop(key, None)
-    return {
-        "status": "rejected_source",
-        "url": url,
-        "source": identifier,
-        "score": source_score,
-    }
 
 
 async def _flush_sampled_leads(
@@ -1094,12 +1345,21 @@ async def _flush_sampled_leads(
         source_stats = _source_stats_for_url(url, ctx)
         status = await ctx.sheets_writer.append_row(url, data)
         if status == "saved":
-            _record_domain_save(url, ctx)
-            source_stats.saved_count += 1
-            _record_saved_lead(url, data, source_status, source_family, ctx)
+            async with ctx.state_lock:
+                _record_domain_save(url, ctx)
+                source_stats.saved_count += 1
+                _record_saved_lead(url, data, source_status, source_family, ctx)
+                _mark_terminal_url(url, "saved", ctx)
+                social_domain = _domain_for_url(url)
+                if social_domain == "linkedin.com":
+                    ctx.social_platform_saves["linkedin"] = ctx.social_platform_saves.get("linkedin", 0) + 1
+                elif social_domain in {"x.com", "twitter.com"}:
+                    ctx.social_platform_saves["x"] = ctx.social_platform_saves.get("x", 0) + 1
             print(f"  ✓ Saved: {data.get('name') or url}", flush=True)
         else:
-            source_stats.duplicate_count += 1
+            async with ctx.state_lock:
+                source_stats.duplicate_count += 1
+                _mark_terminal_url(url, "duplicate", ctx)
             print(f"  • Duplicate skipped: {data.get('name') or url}", flush=True)
 
 
@@ -1296,6 +1556,26 @@ def _is_minimally_viable_lead(data: dict[str, Any], source_url: str) -> tuple[bo
     return False, "missing supporting data (job_title, company, email, phone, or distinct social_media)"
 
 
+def _is_blank_social_profile_data(source_url: str, data: dict[str, Any]) -> bool:
+    """Return True when a social profile has no meaningful person or support fields."""
+    domain = _domain_for_url(source_url)
+    if domain not in {"linkedin.com", "x.com", "twitter.com"}:
+        return False
+
+    name = data.get("name")
+    job_title = data.get("job_title")
+    company = data.get("company")
+    email = data.get("email")
+    phone = data.get("phone")
+    website = data.get("website")
+
+    if _is_plausible_person_name(name):
+        return False
+    if any(_has_meaningful_value(value) for value in (job_title, company, email, phone, website)):
+        return False
+    return True
+
+
 def _selector_map_for_fetch(
     fetch_id: str,
     field_names: list[str] | None,
@@ -1417,7 +1697,7 @@ def _coerce_fetch_id(arguments: dict[str, Any], ctx: ToolContext) -> str:
 
     url = arguments.get("url")
     if isinstance(url, str) and url.strip():
-        return ctx.url_to_fetch_id.get(_normalize_url(url), "")
+        return _lookup_fetch_id(url, ctx)
 
     return ""
 
@@ -1483,6 +1763,8 @@ def _postprocess_extracted_fields(
         if not isinstance(extracted_data, dict):
             extracted_data = {}
         hint_data = ctx.social_profile_hints.get(_normalize_url(final_url), {})
+        if not hint_data:
+            hint_data = ctx.social_profile_hints.get(final_url, {})
         fallback_social: dict[str, Any] = {}
         for field_name in {"name", "job_title", "company", "email", "phone", "website", "social_media", "headline"}:
             extracted_value = extracted_data.get(field_name)
