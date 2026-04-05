@@ -359,6 +359,8 @@ TOOL_DEFINITIONS = [
 async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> dict[str, Any]:
     """Route a tool call to the appropriate handler and return its result."""
     ctx.tool_call_count += 1
+    if tool_name == "fetch_url":
+        tool_name = "fetch_page"
     if tool_name == "suggest_targets":
         return _tool_suggest_targets(arguments.get("limit", 8), ctx)
     if tool_name == "fetch_page":

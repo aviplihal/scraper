@@ -230,6 +230,32 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["page_kind"], "profile")
 
+    async def test_fetch_url_alias_routes_to_fetch_page(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "https://github.com",
+                "min_leads": 1,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+            scraper_browser=_FakeScraperBrowser(),
+        )
+
+        class _FakeFetchResult:
+            final_url = "https://github.com/alice-smith"
+            html = "<html><body><h1>Alice Smith</h1></body></html>"
+
+        with patch("tools.registry.smart_fetch", return_value=_FakeFetchResult()):
+            result = await dispatch_tool(
+                "fetch_url",
+                {"url": "https://github.com/alice-smith"},
+                ctx,
+            )
+
+        self.assertEqual(result["page_kind"], "profile")
+
     async def test_list_links_can_resolve_fetch_id_from_url(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(

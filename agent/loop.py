@@ -36,6 +36,7 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
 
     client = ollama.AsyncClient()
     follow_through_reminders = 0
+    last_follow_through_signature: tuple[int, int, int, int, str] | None = None
     run_result = {
         "steps_run": 0,
         "status": "unknown",
@@ -100,6 +101,11 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
         messages.append({"role": "assistant", "content": message.content or "", "tool_calls": message.tool_calls})
 
         if not message.tool_calls:
+            current_signature = _follow_through_signature(ctx)
+            if current_signature != last_follow_through_signature:
+                follow_through_reminders = 0
+                last_follow_through_signature = current_signature
+
             if _should_request_follow_through(ctx) and follow_through_reminders < 2:
                 follow_through_reminders += 1
                 reminder = _build_follow_through_reminder(ctx)
@@ -170,6 +176,10 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                 _print_targeting_brief(result)
 
             messages.append({"role": "tool", "content": result_str})
+
+            if "error" not in result:
+                follow_through_reminders = 0
+                last_follow_through_signature = _follow_through_signature(ctx)
 
             # fail_url signals we should stop processing the current URL
             if ctx.failed_url_flag:
@@ -547,15 +557,21 @@ def _remaining_candidate_domains(ctx: ToolContext) -> list[str]:
 def _candidate_preview_urls(ctx: ToolContext, limit: int = 3) -> list[str]:
     """Return a few suggested starter URLs, preferring domains not fetched yet."""
     preview_urls: list[str] = []
-    remaining_domains = set(_remaining_candidate_domains(ctx))
+    remaining_domains = _remaining_candidate_domains(ctx)
     prioritized_targets = list(ctx.suggested_targets)
+
     if remaining_domains:
-        prioritized_targets.sort(
-            key=lambda target: (
-                str(target.get("domain", "")) not in remaining_domains,
-                str(target.get("domain", "")),
-            )
-        )
+        for domain in remaining_domains:
+            for target in prioritized_targets:
+                if str(target.get("domain", "")).strip() != domain:
+                    continue
+                url = str(target.get("url", "")).strip()
+                if not url or url in preview_urls:
+                    continue
+                preview_urls.append(url)
+                break
+            if len(preview_urls) >= limit:
+                return preview_urls[:limit]
 
     for target in prioritized_targets:
         url = str(target.get("url", "")).strip()
@@ -589,3 +605,14 @@ def _switch_candidate_domain(ctx: ToolContext) -> str | None:
         return None
 
     return last_domain
+
+
+def _follow_through_signature(ctx: ToolContext) -> tuple[int, int, int, int, str]:
+    """Return a lightweight snapshot of actionable state for reminder budgeting."""
+    return (
+        len(_unprocessed_fetch_ids(ctx)),
+        len(_remaining_candidate_domains(ctx)),
+        _saved_lead_count(ctx),
+        ctx.tool_call_count,
+        ctx.source_phase,
+    )

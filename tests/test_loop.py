@@ -9,6 +9,7 @@ from unittest.mock import patch
 from agent.loop import (
     _auto_fail_remaining_non_actionable_pages,
     _build_follow_through_reminder,
+    _candidate_preview_urls,
     _maybe_switch_to_discovery_phase,
     _try_automatic_profile_processing,
     run_agent_loop,
@@ -253,6 +254,36 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
         reminder = _build_follow_through_reminder(ctx)
 
         self.assertIn("Prefer a different domain/source now because github.com has not produced a viable lead yet", reminder)
+
+    def test_candidate_preview_urls_are_domain_diverse_first(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find public engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 3,
+            },
+            sheets_writer=writer,
+            source_mode="all",
+        )
+        ctx.suggested_targets = [
+            {"url": "https://github.com/search?q=Senior+Software+Engineer&type=users", "domain": "github.com"},
+            {"url": "https://github.com/search?q=Software+Engineer&type=users", "domain": "github.com"},
+            {"url": "https://www.linkedin.com/search/results/people/?keywords=Senior+Software+Engineer", "domain": "linkedin.com"},
+            {"url": "https://x.com/search?q=Senior+Software+Engineer&f=user", "domain": "x.com"},
+        ]
+        ctx.allowed_domains = {"github.com", "linkedin.com", "x.com"}
+        ctx.candidate_domains = ["github.com", "linkedin.com", "x.com"]
+
+        preview = _candidate_preview_urls(ctx, limit=3)
+
+        self.assertEqual(len(preview), 3)
+        self.assertTrue(any("github.com" in url for url in preview))
+        self.assertTrue(any("linkedin.com" in url for url in preview))
+        self.assertTrue(any("x.com" in url for url in preview))
 
     def test_follow_through_reminder_mentions_discovery_sampling(self) -> None:
         writer = _DummyWriter()
