@@ -66,11 +66,13 @@ def suggest_targets(
     limit: int = 8,
     source_state: SourceState | None = None,
     phase: str = "pass1",
+    extra_terms: list[str] | None = None,
+    extra_areas: list[str] | None = None,
 ) -> dict:
     """Return a keyword brief plus domain-diverse candidate targets for the run."""
     website = str(client_config.get("website", "NA")).strip()
     strategy = _infer_strategy(client_config)
-    keyword_brief = _build_keyword_brief(strategy, client_config, source_mode)
+    keyword_brief = _build_keyword_brief(strategy, client_config, source_mode, extra_terms=extra_terms)
 
     if website and website.upper() != "NA":
         candidate_targets = _dedupe_candidate_targets(
@@ -97,6 +99,7 @@ def suggest_targets(
             source_mode,
             source_state=source_state,
             phase=phase,
+            extra_areas=extra_areas,
         ),
         limit,
     )
@@ -128,10 +131,17 @@ def _infer_strategy(client_config: dict) -> str:
     return "general_people"
 
 
-def _build_keyword_brief(strategy: str, client_config: dict, source_mode: str) -> dict[str, object]:
+def _build_keyword_brief(
+    strategy: str,
+    client_config: dict,
+    source_mode: str,
+    extra_terms: list[str] | None = None,
+) -> dict[str, object]:
     requested_title = str(client_config.get("job_title", "")).strip()
     requested_job = str(client_config.get("job", "")).strip()
     strategy_terms = _strategy_terms(strategy, requested_title, client_config)
+    if extra_terms:
+        strategy_terms = _dedupe_terms([*strategy_terms, *extra_terms])
     secondary_limit = 10 if strategy == "technical_profiles" and _lead_target_size(client_config) >= 25 else 3
     primary_terms = _dedupe_terms([requested_title or requested_job or strategy_terms[0]])
     secondary_terms = [
@@ -154,6 +164,7 @@ def _candidate_targets_for_strategy(
     source_mode: str,
     source_state: SourceState | None = None,
     phase: str = "pass1",
+    extra_areas: list[str] | None = None,
 ) -> list[dict[str, object]]:
     primary_terms = list(keyword_brief.get("primary_terms", []))
     secondary_terms = list(keyword_brief.get("secondary_terms", []))
@@ -174,6 +185,7 @@ def _candidate_targets_for_strategy(
         search_terms,
         area,
         client_config,
+        extra_areas,
         _enabled_social_platforms(client_config),
         effective_source_mode,
     )
@@ -225,6 +237,17 @@ def _area_variants(area: str, client_config: dict) -> list[str]:
     elif "bay area" in lower:
         variants.append("San Francisco")
     return _dedupe_terms(variants)
+
+
+def _effective_area_variants(
+    area: str,
+    client_config: dict,
+    extra_areas: list[str] | None = None,
+) -> list[str]:
+    """Return the final area variants after merging config and reseed hints."""
+    merged = [*_area_variants(area, client_config), *(extra_areas or [])]
+    normalized = _dedupe_terms([value for value in merged if str(value).strip()])
+    return normalized or ["NA"]
 
 
 def _social_target_groups(
@@ -417,12 +440,13 @@ def _catalog_for_strategy(
     search_terms: list[str],
     area: str,
     client_config: dict,
+    extra_areas: list[str] | None,
     enabled_social_platforms: list[str],
     source_mode: str,
 ) -> list[dict[str, object]]:
     groups: list[dict[str, object]] = []
     if source_mode in {"web", "all"}:
-        groups.extend(_web_target_groups(strategy, search_terms, area, client_config))
+        groups.extend(_web_target_groups(strategy, search_terms, area, client_config, extra_areas))
     if source_mode in {"human_emulator", "all"}:
         groups.extend(_social_target_groups(search_terms, area, enabled_social_platforms))
     return groups
@@ -433,6 +457,7 @@ def _web_target_groups(
     search_terms: list[str],
     area: str,
     client_config: dict,
+    extra_areas: list[str] | None,
 ) -> list[dict[str, object]]:
     groups: list[dict[str, object]] = []
 
@@ -479,7 +504,7 @@ def _web_target_groups(
         if strategy == "technical_profiles":
             github_targets = [
                 _github_search_target(term, area_variant)
-                for area_variant in _area_variants(area, client_config)
+                for area_variant in _effective_area_variants(area, client_config, extra_areas)
                 for term in search_terms
             ]
         else:
@@ -597,7 +622,7 @@ def _dedupe_candidate_targets(targets: list[dict[str, object]], limit: int) -> l
             continue
         deduped.append(target)
         seen_urls.add(url)
-        if len(deduped) >= max(1, min(limit, 20)):
+        if len(deduped) >= max(1, int(limit)):
             break
     return deduped
 

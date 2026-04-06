@@ -12,6 +12,7 @@ from tools.registry import (
     ToolContext,
     _normalize_lead_payload,
     _normalize_url,
+    _prepare_target_reseed,
     _record_domain_failure,
     _record_fetch_outcome,
     dispatch_tool,
@@ -187,6 +188,9 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
             0,
             tuple(),
             ("gitlab.com",),
+            tuple(),
+            tuple(),
+            0,
         )
         ctx.suggested_targets = [
             {"url": "https://duckduckgo.com/html?q=site%3Agithub.com+%22Engineer%22", "domain": "duckduckgo.com"},
@@ -228,6 +232,68 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["status"], "unchanged")
         self.assertTrue(second_urls)
         self.assertTrue(set(first_urls).isdisjoint(second_urls))
+
+    async def test_prepare_target_reseed_derives_terms_from_recent_approved_leads(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "job": "find senior software engineers open to new opportunities",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 100,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "job": "find senior software engineers open to new opportunities",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 100,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="pass1",
+                    target_strategy="technical_profiles",
+                )
+                ctx.current_run_saved_leads = [
+                    {
+                        "url": "https://github.com/alice",
+                        "data": {"name": "Alice", "job_title": "Staff Software Engineer at Box"},
+                        "source_status": "approved",
+                    },
+                    {
+                        "url": "https://github.com/bob",
+                        "data": {"name": "Bob", "job_title": "Principal Engineer @ Reddit"},
+                        "source_status": "approved",
+                    },
+                    {
+                        "url": "https://github.com/carla",
+                        "data": {"name": "Carla", "job_title": "Solution Architect and Senior Software Engineer"},
+                        "source_status": "approved",
+                    },
+                ]
+
+                reseed = _prepare_target_reseed(ctx)
+
+                self.assertIsNotNone(reseed)
+                self.assertIn("Staff Software Engineer", ctx.reseed_search_terms)
+                self.assertIn("Principal Engineer", ctx.reseed_search_terms)
+                self.assertIn("Solution Architect", ctx.reseed_search_terms)
+                self.assertIn("San Francisco Bay Area", ctx.reseed_area_variants)
+            finally:
+                os.chdir(old_cwd)
 
     async def test_suggest_targets_filters_duckduckgo_queries_for_banned_follow_on_domains(self) -> None:
         writer = _DummyWriter()

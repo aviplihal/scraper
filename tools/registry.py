@@ -192,7 +192,10 @@ class ToolContext:
     social_platform_saves: dict[str, int] = field(default_factory=dict)
     low_yield_platforms: set[str] = field(default_factory=set)
     parse_attempt_counts: dict[str, int] = field(default_factory=dict)
-    last_suggest_targets_signature: tuple[str, int, int, int, int] | None = None
+    reseed_search_terms: list[str] = field(default_factory=list)
+    reseed_area_variants: list[str] = field(default_factory=list)
+    reseed_generation: int = 0
+    last_suggest_targets_signature: tuple[Any, ...] | None = None
     state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     social_platform_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     source_sample_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
@@ -460,6 +463,9 @@ def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
         len(ctx.exhausted_discovery_urls),
         tuple(sorted(ctx.unavailable_domains)),
         tuple(sorted(domain for domain, outcome in ctx.domain_outcomes.items() if outcome.banned_for_run)),
+        tuple(ctx.reseed_search_terms),
+        tuple(ctx.reseed_area_variants),
+        ctx.reseed_generation,
     )
     if (
         ctx.suggest_targets_called
@@ -496,6 +502,8 @@ def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
         limit=_suggest_target_catalog_limit(ctx, requested_limit),
         source_state=ctx.source_state,
         phase=ctx.source_phase,
+        extra_terms=ctx.reseed_search_terms,
+        extra_areas=ctx.reseed_area_variants,
     )
     targets = _filter_candidate_targets(
         result.get("candidate_targets", []),
@@ -1833,6 +1841,136 @@ def _baseline_leads(ctx: ToolContext, limit: int = 3) -> list[dict[str, Any]]:
         if len(baseline) >= limit:
             break
     return baseline[:limit]
+
+
+_RESEED_TITLE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("principal software engineer", "Principal Software Engineer"),
+    ("principal engineer", "Principal Engineer"),
+    ("senior staff software engineer", "Senior Staff Software Engineer"),
+    ("staff software engineer", "Staff Software Engineer"),
+    ("staff engineer", "Staff Engineer"),
+    ("solution architect", "Solution Architect"),
+    ("software architect", "Software Architect"),
+    ("cloud architect", "Cloud Architect"),
+    ("architect", "Architect"),
+    ("engineering manager", "Engineering Manager"),
+    ("senior backend engineer", "Senior Backend Engineer"),
+    ("senior frontend engineer", "Senior Frontend Engineer"),
+    ("senior full stack engineer", "Senior Full Stack Engineer"),
+    ("senior software engineer", "Senior Software Engineer"),
+    ("software engineer", "Software Engineer"),
+    ("platform engineer", "Platform Engineer"),
+    ("backend engineer", "Backend Engineer"),
+    ("frontend engineer", "Frontend Engineer"),
+    ("full stack engineer", "Full Stack Engineer"),
+)
+
+
+def _prepare_target_reseed(ctx: ToolContext) -> dict[str, Any] | None:
+    """Derive fresh keyword-driven starter terms from recent approved leads."""
+    if str(ctx.client_config.get("website", "NA")).strip().upper() != "NA":
+        return None
+    if ctx.source_phase != "pass1":
+        return None
+    if (ctx.target_strategy or "") not in {"technical_profiles", ""}:
+        return None
+
+    baseline = _baseline_leads(ctx, limit=3)
+    if not baseline:
+        return None
+
+    terms = _derive_reseed_search_terms(baseline, ctx)
+    areas = _derive_reseed_area_variants(baseline, ctx)
+    if not terms and not areas:
+        return None
+
+    if (
+        tuple(terms) == tuple(ctx.reseed_search_terms)
+        and tuple(areas) == tuple(ctx.reseed_area_variants)
+        and ctx.reseed_generation > 0
+    ):
+        return None
+
+    ctx.reseed_search_terms = list(terms)
+    ctx.reseed_area_variants = list(areas)
+    ctx.reseed_generation += 1
+    return {
+        "baseline": baseline,
+        "terms": list(terms),
+        "areas": list(areas),
+        "generation": ctx.reseed_generation,
+    }
+
+
+def _derive_reseed_search_terms(baseline_leads: list[dict[str, Any]], ctx: ToolContext) -> list[str]:
+    """Extract stronger follow-on title queries from recent approved leads."""
+    derived: list[str] = []
+    for row in baseline_leads[:3]:
+        job_title = str(row.get("job_title") or "").strip().lower()
+        if not job_title:
+            continue
+        normalized_title = " ".join(job_title.replace("|", " ").replace("/", " ").replace(",", " ").split())
+        for pattern, canonical in _RESEED_TITLE_PATTERNS:
+            if pattern in normalized_title:
+                derived.append(canonical)
+
+    fallback_terms = [
+        str(ctx.client_config.get("job_title", "")).strip(),
+        "Staff Engineer",
+        "Principal Engineer",
+        "Solution Architect",
+    ]
+    derived.extend(fallback_terms)
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    existing_terms = {
+        str(ctx.client_config.get("job_title", "")).strip().lower(),
+        "senior software engineer",
+        "software engineer",
+        "architect",
+    }
+    for term in derived:
+        cleaned = str(term).strip()
+        lowered = cleaned.lower()
+        if not cleaned or lowered in seen:
+            continue
+        seen.add(lowered)
+        if lowered in existing_terms and ordered:
+            continue
+        ordered.append(cleaned)
+    return ordered[:8]
+
+
+def _derive_reseed_area_variants(baseline_leads: list[dict[str, Any]], ctx: ToolContext) -> list[str]:
+    """Return broader area variants hinted by config and recent saved leads."""
+    configured_area = str(ctx.client_config.get("area", "NA")).strip() or "NA"
+    variants: list[str] = []
+    if configured_area.upper() != "NA":
+        variants.append(configured_area)
+
+    text_blob = " ".join(
+        str(value).lower()
+        for row in baseline_leads[:3]
+        for value in (row.get("job_title", ""), row.get("company", ""), row.get("social_media", ""))
+    )
+    if "san francisco bay area" in text_blob:
+        variants.extend(["San Francisco Bay Area", "San Francisco", "Bay Area"])
+    elif "san francisco" in text_blob:
+        variants.extend(["San Francisco", "Bay Area"])
+    elif "bay area" in text_blob:
+        variants.extend(["San Francisco Bay Area", "Bay Area"])
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in variants:
+        cleaned = str(value).strip()
+        lowered = cleaned.lower()
+        if not cleaned or cleaned.upper() == "NA" or lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(cleaned)
+    return deduped[:3]
 
 
 def _lead_quality_score(data: dict[str, Any], ctx: ToolContext) -> int:

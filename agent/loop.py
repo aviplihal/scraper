@@ -18,6 +18,7 @@ from agent.prompts import SYSTEM_PROMPT, build_user_prompt
 from tools.registry import (
     TOOL_DEFINITIONS,
     ToolContext,
+    _prepare_target_reseed,
     _curated_target_pool_exhausted,
     _domain_for_url,
     _finalize_partial_discovery_samples,
@@ -167,6 +168,9 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                 messages.append({"role": "user", "content": reminder})
                 continue
 
+            if _maybe_reseed_target_pool(ctx, messages):
+                continue
+
             if _maybe_switch_to_discovery_phase(ctx, messages):
                 continue
 
@@ -204,6 +208,9 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
         last_follow_through_signature = _follow_through_signature(ctx)
         if reached_target_this_step:
             break
+
+        if _maybe_reseed_target_pool(ctx, messages):
+            continue
 
         if _maybe_switch_to_discovery_phase(ctx, messages):
             continue
@@ -643,6 +650,7 @@ def _unprocessed_fetch_ids(ctx: ToolContext) -> list[str]:
 
 def _build_follow_through_reminder(ctx: ToolContext) -> str:
     """Build a targeted reminder telling the model how to process fetched pages."""
+    starter_preview_limit = 6 if _lead_target(ctx) >= 25 else 3
     if _needs_target_suggestions(ctx):
         return (
             f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
@@ -706,7 +714,7 @@ def _build_follow_through_reminder(ctx: ToolContext) -> str:
         )
 
     if _needs_target_fetch_follow_through(ctx):
-        preview = " ".join(_candidate_preview_urls(ctx, limit=3))
+        preview = " ".join(_candidate_preview_urls(ctx, limit=starter_preview_limit))
         if not preview:
             return (
                 f"Progress: saved {_saved_lead_count(ctx)}/{_lead_target(ctx)} viable leads. "
@@ -943,6 +951,42 @@ def _maybe_switch_to_discovery_phase(ctx: ToolContext, messages: list[dict]) -> 
                 "Start pass 2 now: call suggest_targets again, stay close to the approved source families, "
                 "sample up to 3 viable leads from any new source before deeper scraping, and keep going until "
                 "you reach the lead target or useful work is exhausted."
+            ),
+        }
+    )
+    return True
+
+
+def _maybe_reseed_target_pool(ctx: ToolContext, messages: list[dict]) -> bool:
+    """Refresh pass1 starter targets from baseline approved leads before giving up."""
+    reseed = _prepare_target_reseed(ctx)
+    if not reseed:
+        return False
+
+    ctx.suggest_targets_called = False
+    ctx.suggested_targets.clear()
+    ctx.suggested_target_urls.clear()
+    ctx.allowed_domains.clear()
+    ctx.candidate_domains.clear()
+    ctx.avoid_domains.clear()
+    ctx.keyword_brief.clear()
+    ctx.target_strategy = None
+    ctx.source_mix = None
+    ctx.last_suggest_targets_signature = None
+
+    terms = ", ".join(reseed.get("terms", [])[:4]) or "recent approved lead patterns"
+    print(
+        "[agent] Pass 1 starter targets were exhausted. "
+        f"Reseeding approved-source searches from recent saved leads (generation {reseed['generation']}): {terms}.",
+        flush=True,
+    )
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "The current approved-source starter targets are exhausted, but the lead target is still unmet. "
+                "Use recent saved leads as the comparison baseline, call suggest_targets again, and continue with "
+                "fresh approved-source searches that match those stronger title patterns before moving on."
             ),
         }
     )

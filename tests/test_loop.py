@@ -11,6 +11,7 @@ from agent.loop import (
     _build_follow_through_reminder,
     _candidate_preview_urls,
     _conversation_state_summary,
+    _maybe_reseed_target_pool,
     _maybe_switch_to_discovery_phase,
     _normalized_tool_name,
     _maybe_compact_messages,
@@ -519,6 +520,64 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertFalse(switched)
                 self.assertEqual(ctx.source_phase, "pass1")
+            finally:
+                os.chdir(old_cwd)
+
+    def test_pass1_reseeds_from_recent_approved_leads_before_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "job": "find senior software engineers open to new opportunities",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 100,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "job": "find senior software engineers open to new opportunities",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 100,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="pass1",
+                    target_strategy="technical_profiles",
+                )
+                ctx.current_run_saved_leads = [
+                    {
+                        "url": "https://github.com/alice",
+                        "data": {"name": "Alice", "job_title": "Staff Software Engineer at Box"},
+                        "source_status": "approved",
+                    },
+                    {
+                        "url": "https://github.com/bob",
+                        "data": {"name": "Bob", "job_title": "Principal Engineer @ Reddit"},
+                        "source_status": "approved",
+                    },
+                ]
+
+                messages: list[dict] = []
+                reseeded = _maybe_reseed_target_pool(ctx, messages)
+
+                self.assertTrue(reseeded)
+                self.assertEqual(ctx.source_phase, "pass1")
+                self.assertFalse(ctx.suggest_targets_called)
+                self.assertIn("Staff Software Engineer", ctx.reseed_search_terms)
+                self.assertIn("call suggest_targets again", messages[0]["content"])
             finally:
                 os.chdir(old_cwd)
 

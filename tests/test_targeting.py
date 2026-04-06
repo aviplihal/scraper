@@ -205,7 +205,7 @@ class TargetingTests(unittest.TestCase):
             for target in result["candidate_targets"]
             if target["domain"] == "github.com"
         ]
-        self.assertGreaterEqual(len(github_urls), 12)
+        self.assertGreaterEqual(len(github_urls), 20)
         self.assertTrue(any("Staff+Engineer" in url for url in github_urls))
         self.assertTrue(any("Principal+" in url for url in github_urls))
         self.assertTrue(any("location%3A%22San+Francisco%22" in url for url in github_urls))
