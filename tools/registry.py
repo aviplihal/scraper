@@ -73,6 +73,12 @@ _COMPANY_TEAM_HINTS = {
     "cloud",
     "ai",
 }
+_LOW_QUALITY_COMPANY_VALUES = {
+    "me",
+    "myself",
+    "self",
+    "pdf reader",
+}
 
 # Social-media domains that must be routed to the human emulator
 SOCIAL_MEDIA_DOMAINS: frozenset[str] = frozenset(
@@ -1219,11 +1225,15 @@ def _filter_candidate_targets(targets: list[dict[str, Any]], ctx: ToolContext) -
         outcome = ctx.domain_outcomes.get(domain)
         if outcome and outcome.banned_for_run:
             continue
+        if _persistent_source_excluded_for_discovery(domain, ctx):
+            continue
         if domain == "duckduckgo.com":
             site_domain = _duckduckgo_target_site_domain(url)
             if site_domain:
                 site_outcome = ctx.domain_outcomes.get(site_domain)
                 if site_domain in ctx.unavailable_domains or (site_outcome and site_outcome.banned_for_run):
+                    continue
+                if _persistent_source_excluded_for_discovery(site_domain, ctx):
                     continue
         if domain == "linkedin.com" and "linkedin" in ctx.low_yield_platforms:
             continue
@@ -1323,6 +1333,20 @@ def _remove_domain_from_candidate_pool(domain: str, ctx: ToolContext) -> None:
     }
 
 
+def _persistent_source_excluded_for_discovery(domain: str, ctx: ToolContext) -> bool:
+    """Return True when discovery should not revisit a previously classified source."""
+    if ctx.source_phase != "discovery" or ctx.source_state is None or not domain:
+        return False
+
+    kind, identifier = infer_source_identity(domain)
+    status = ctx.source_state.source_status(kind, identifier)
+    if status in {"approved", "temporary_seed", "pending_review", "rejected"}:
+        return True
+
+    metadata = ctx.source_state.metadata_for(kind, identifier)
+    return bool(metadata.get("exhausted"))
+
+
 def _mark_social_platform_unavailable(platform: str, reason: str, ctx: ToolContext) -> None:  # noqa: ARG001
     """Mark a social platform unavailable for the rest of the current run."""
     ctx.active_social_platforms.discard(platform)
@@ -1404,6 +1428,8 @@ def _allow_discovered_follow_on_url(normalized_url: str, domain: str, ctx: ToolC
         return False
     outcome = ctx.domain_outcomes.get(domain)
     if outcome and outcome.banned_for_run:
+        return False
+    if _persistent_source_excluded_for_discovery(domain, ctx):
         return False
     return True
 
@@ -1716,6 +1742,55 @@ async def _flush_sampled_leads(
             print(f"  • Duplicate skipped: {data.get('name') or url}", flush=True)
 
 
+async def _finalize_partial_discovery_samples(ctx: ToolContext) -> list[dict[str, Any]]:
+    """Resolve leftover sampled discovery sources when a run exhausts before 3 samples."""
+    if ctx.source_state is None or not ctx.discovery_source_samples:
+        return []
+
+    finalized: list[dict[str, Any]] = []
+    for key in list(ctx.discovery_source_samples):
+        sample_bucket = ctx.discovery_source_samples.get(key, [])
+        if not sample_bucket:
+            ctx.discovery_source_samples.pop(key, None)
+            continue
+
+        kind, identifier = key.split(":", 1)
+        source_stats = _source_stats_for_url(sample_bucket[0]["url"], ctx)
+        family = source_stats.family or infer_source_family(kind, identifier)
+        baseline = _baseline_leads(ctx, limit=3)
+        source_score, lead_scores = _score_candidate_source(sample_bucket, source_stats, ctx)
+        baseline_score = _baseline_score(baseline, ctx)
+        outcome = _classify_candidate_source(source_score, baseline_score, ctx, exhausted=True)
+
+        if outcome == "approved":
+            ctx.source_state.promote_approved(kind, identifier, family, source_score)
+            await _flush_sampled_leads(sample_bucket, "approved", family, ctx)
+        elif outcome == "pending_review":
+            ctx.source_state.queue_for_review(
+                kind,
+                identifier,
+                family,
+                source_score,
+                [item["data"] | {"source_url": item["url"]} for item in sample_bucket],
+                baseline,
+            )
+        else:
+            ctx.source_state.reject_source(kind, identifier, family, source_score)
+
+        ctx.discovery_source_samples.pop(key, None)
+        finalized.append(
+            {
+                "source": identifier,
+                "sample_count": len(sample_bucket),
+                "outcome": outcome,
+                "score": source_score,
+                "lead_scores": lead_scores,
+            }
+        )
+
+    return finalized
+
+
 def _accuracy_thresholds(ctx: ToolContext) -> dict[str, int]:
     """Return the configured source-accuracy preset thresholds."""
     preset = str(ctx.client_config.get("source_accuracy", "balanced")).strip().lower() or "balanced"
@@ -1962,6 +2037,13 @@ def _has_meaningful_value(value: Any) -> bool:
     return True
 
 
+def _same_normalized_text(left: Any, right: Any) -> bool:
+    """Return True when two text fields normalize to the same content."""
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    return _clean_field_text(left).casefold() == _clean_field_text(right).casefold()
+
+
 def _normalize_lead_payload(source_url: str, data: dict[str, Any]) -> dict[str, Any]:
     """Clean noisy extracted lead fields without inventing new facts."""
     normalized = dict(data or {})
@@ -1996,6 +2078,8 @@ def _normalize_lead_payload(source_url: str, data: dict[str, Any]) -> dict[str, 
         normalized.get("website"),
         fallback_social=normalized.get("social_media"),
     )
+    if _same_normalized_text(normalized.get("job_title"), normalized.get("name")):
+        normalized["job_title"] = None
     return normalized
 
 
@@ -2036,6 +2120,8 @@ def _normalize_company_value(value: Any) -> Any:
         return value
     text = _clean_field_text(value)
     if not text:
+        return None
+    if text.casefold() in _LOW_QUALITY_COMPANY_VALUES:
         return None
 
     tokens = [_humanize_org_token(token) for token in text.split("@") if token.strip()]
@@ -2203,8 +2289,12 @@ def _is_minimally_viable_lead(data: dict[str, Any], source_url: str) -> tuple[bo
     if _looks_like_handle_name(name) and not _has_strong_handle_support(data, source_url):
         return False, "name looks like a handle without enough supporting evidence"
 
-    support_fields = ("job_title", "company", "email", "phone")
-    if any(_has_meaningful_value(data.get(field)) for field in support_fields):
+    job_title = data.get("job_title")
+    company = data.get("company")
+    has_job_title = _has_meaningful_value(job_title) and not _same_normalized_text(job_title, name)
+    has_company = _has_meaningful_value(company)
+    has_direct_contact = any(_has_meaningful_value(data.get(field)) for field in ("email", "phone"))
+    if has_job_title or has_company or has_direct_contact:
         return True, ""
 
     social_media = data.get("social_media")
@@ -2400,6 +2490,12 @@ def _postprocess_extracted_fields(
         derived_title = _github_role_from_title(title, username)
         name = result.get("name")
         job_title = result.get("job_title")
+        if isinstance(derived_title, str):
+            derived_title = derived_title.strip() or None
+        if isinstance(derived_title, str) and name and _same_normalized_text(derived_title, name):
+            derived_title = None
+        if isinstance(derived_title, str) and not _looks_like_title_fragment(derived_title):
+            derived_title = None
 
         if _looks_like_role_text(name):
             result["name"] = username or name

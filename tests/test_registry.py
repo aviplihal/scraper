@@ -223,6 +223,49 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         urls = [target["url"] for target in result["candidate_targets"]]
         self.assertTrue(all("site%3Agitlab.com" not in url for url in urls))
 
+    async def test_suggest_targets_filters_duckduckgo_queries_for_persistently_exhausted_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "job": "find public engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 10,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                state.promote_temporary_seed("web_domain", "gitlab.com", "developer_profiles", 82)
+                state.mark_temporary_seed_exhausted("web_domain", "gitlab.com", "Repeated runs produced no new viable leads.")
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "job": "find public engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 10,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="discovery",
+                )
+
+                result = await dispatch_tool("suggest_targets", {"limit": 8}, ctx)
+
+                urls = [target["url"] for target in result["candidate_targets"]]
+                self.assertTrue(all("site%3Agitlab.com" not in url for url in urls))
+            finally:
+                os.chdir(old_cwd)
+
     async def test_suggest_targets_returns_curated_leadership_targets(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
@@ -461,6 +504,65 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["page_kind"], "profile")
+
+    async def test_broad_mode_rejects_discovered_follow_on_profile_from_persistently_exhausted_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "job": "find public engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 1,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                state.promote_temporary_seed("web_domain", "gitlab.com", "developer_profiles", 82)
+                state.mark_temporary_seed_exhausted("web_domain", "gitlab.com", "Repeated runs produced no new viable leads.")
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "job": "find public engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 1,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    scraper_browser=_FakeScraperBrowser(),
+                    source_state=state,
+                    source_phase="discovery",
+                )
+                ctx.suggest_targets_called = True
+                ctx.allowed_domains = {"duckduckgo.com"}
+                ctx.candidate_domains = ["duckduckgo.com"]
+                ctx.fetch_metadata["fetch-ddg"] = {
+                    "url": "https://duckduckgo.com/html/?q=site%3Agitlab.com+engineer",
+                    "final_url": "https://html.duckduckgo.com/html/?q=site%3Agitlab.com+engineer",
+                    "title": "search",
+                    "page_kind": "search_results",
+                    "preview": "results",
+                }
+                ctx.discovered_link_parents[_normalize_url("https://gitlab.com/alice-smith")] = "fetch-ddg"
+
+                result = await dispatch_tool(
+                    "fetch_page",
+                    {"url": "https://gitlab.com/alice-smith", "needs_javascript": False},
+                    ctx,
+                )
+
+                self.assertIn("error", result)
+                self.assertIn("outside the candidate domain pool", result["error"])
+            finally:
+                os.chdir(old_cwd)
 
     async def test_web_mode_rejects_social_media_urls(self) -> None:
         writer = _DummyWriter()
@@ -1005,6 +1107,43 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_parse_html_github_does_not_promote_name_only_title_to_job_title(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "NA",
+                "min_leads": 1,
+                "fields": {"name": "Full name", "job_title": "Title"},
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.page_cache["fetch-name-title"] = """
+        <html>
+          <head><title>andrewchen (Andrew Chen) · GitHub</title></head>
+          <body>
+            <span itemprop="name">Andrew Chen</span>
+          </body>
+        </html>
+        """
+        ctx.fetch_metadata["fetch-name-title"] = {
+            "url": "https://github.com/andrewchen",
+            "final_url": "https://github.com/andrewchen",
+            "title": "andrewchen (Andrew Chen) · GitHub",
+            "page_kind": "profile",
+            "preview": "Andrew Chen",
+        }
+
+        result = await dispatch_tool(
+            "parse_html",
+            {"fetch_id": "fetch-name-title", "field_names": ["name", "job_title"]},
+            ctx,
+        )
+
+        self.assertEqual(result["fields"]["name"], "Andrew Chen")
+        self.assertIsNone(result["fields"]["job_title"])
+
     async def test_parse_html_social_uses_search_hints_when_profile_fields_are_blank(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
@@ -1165,6 +1304,26 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writer.saved_count, 0)
         self.assertEqual(ctx.rejected_weak_count, 1)
 
+    async def test_save_result_rejects_when_job_title_repeats_name(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        result = await dispatch_tool(
+            "save_result",
+            {
+                "url": "https://github.com/andrewchen",
+                "data": {"name": "Andrew Chen", "job_title": "Andrew Chen"},
+            },
+            ctx,
+        )
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(writer.saved_count, 0)
+
     async def test_save_result_accepts_name_plus_job_title(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(
@@ -1184,6 +1343,26 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "saved")
         self.assertEqual(writer.saved_count, 1)
+
+    async def test_save_result_rejects_low_quality_company_placeholder(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={"client_id": "test", "website": "NA", "min_leads": 1},
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        result = await dispatch_tool(
+            "save_result",
+            {
+                "url": "https://github.com/emilyjohnson",
+                "data": {"name": "Emily Johnson", "job_title": "Emily Johnson", "company": "PDF reader"},
+            },
+            ctx,
+        )
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(writer.saved_count, 0)
 
     async def test_save_result_normalizes_noisy_job_title_and_company(self) -> None:
         writer = _DummyWriter()
