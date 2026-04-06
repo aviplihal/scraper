@@ -20,6 +20,7 @@ from tools.registry import (
     ToolContext,
     _curated_target_pool_exhausted,
     _domain_for_url,
+    _finalize_partial_discovery_samples,
     _fetch_budget_for_url,
     _fetch_budget_key,
     _normalize_url,
@@ -170,11 +171,16 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                 continue
 
             if _no_viable_next_actions(ctx):
+                await _finalize_partial_discovery_work(ctx, step)
                 print(f"\n[agent] Agent finished after {step} step(s) — no viable next actions remained.")
                 run_result["status"] = "completed"
-                run_result["stop_reason"] = _under_target_stop_reason(
-                    ctx,
-                    "No actionable pages or fetchable candidate targets remained",
+                run_result["stop_reason"] = (
+                    _lead_target_stop_reason(ctx)
+                    if _lead_target_reached(ctx)
+                    else _under_target_stop_reason(
+                        ctx,
+                        "No actionable pages or fetchable candidate targets remained",
+                    )
                 )
                 break
 
@@ -199,12 +205,20 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
         if reached_target_this_step:
             break
 
+        if _maybe_switch_to_discovery_phase(ctx, messages):
+            continue
+
         if _no_viable_next_actions(ctx):
+            await _finalize_partial_discovery_work(ctx, step)
             print(f"\n[agent] Agent finished after step {step} — no viable next actions remained.")
             run_result["status"] = "completed"
-            run_result["stop_reason"] = _under_target_stop_reason(
-                ctx,
-                "No actionable pages or fetchable candidate targets remained",
+            run_result["stop_reason"] = (
+                _lead_target_stop_reason(ctx)
+                if _lead_target_reached(ctx)
+                else _under_target_stop_reason(
+                    ctx,
+                    "No actionable pages or fetchable candidate targets remained",
+                )
             )
             break
 
@@ -830,6 +844,22 @@ async def _auto_fail_remaining_non_actionable_pages(
         processed_any = True
 
     return processed_any
+
+
+async def _finalize_partial_discovery_work(ctx: ToolContext, step: int) -> bool:
+    """Resolve in-flight sampled discovery sources before stopping a run."""
+    finalized = await _finalize_partial_discovery_samples(ctx)
+    if not finalized:
+        return False
+
+    for item in finalized:
+        print(
+            "[agent] Finalized sampled discovery source "
+            f"{item['source']} at {item['sample_count']} sample(s): "
+            f"{item['outcome']} (score={item['score']}).",
+            flush=True,
+        )
+    return True
 
 
 def _looks_saveable_name(value: object) -> bool:

@@ -637,6 +637,156 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["completion_tokens"], 45)
         self.assertEqual(result["total_tokens"], 168)
 
+    async def test_run_finalizes_partial_discovery_samples_before_stopping(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "job": "find engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "NA",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "job": "find engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "NA",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="discovery",
+                )
+                ctx.discovery_source_samples["web_domain:gitlab.com"] = [
+                    {
+                        "url": "https://gitlab.com/alice",
+                        "data": {"name": "Alice Smith", "job_title": "Engineer"},
+                    }
+                ]
+
+                class _FakeClient:
+                    async def chat(self, **_: object) -> SimpleNamespace:
+                        return SimpleNamespace(
+                            message=SimpleNamespace(content="", tool_calls=[]),
+                        )
+
+                with patch("agent.loop.ollama.AsyncClient", return_value=_FakeClient()):
+                    result = await run_agent_loop(ctx.client_config, "web", ctx)
+
+                self.assertEqual(result["status"], "completed")
+                self.assertNotIn("web_domain:gitlab.com", ctx.discovery_source_samples)
+                self.assertIn("gitlab.com", state.rejected_sources()["web_domains"])
+            finally:
+                os.chdir(old_cwd)
+
+    async def test_run_switches_to_discovery_after_tool_batch_exhausts_pass1(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "job": "find engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "job": "find engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="pass1",
+                )
+
+                responses = [
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="",
+                            tool_calls=[SimpleNamespace(function=SimpleNamespace(name="suggest_targets", arguments={"limit": 4}))],
+                        )
+                    ),
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="",
+                            tool_calls=[SimpleNamespace(function=SimpleNamespace(name="suggest_targets", arguments={"limit": 4}))],
+                        )
+                    ),
+                ]
+
+                class _FakeClient:
+                    def __init__(self) -> None:
+                        self.calls = 0
+
+                    async def chat(self, **_: object) -> SimpleNamespace:
+                        response = responses[self.calls]
+                        self.calls += 1
+                        return response
+
+                async def _fake_execute_tool_calls(
+                    step: int,  # noqa: ARG001
+                    tool_calls: list[SimpleNamespace],  # noqa: ARG001
+                    local_ctx: ToolContext,
+                    messages: list[dict],  # noqa: ARG001
+                    run_result: dict,  # noqa: ARG001
+                ) -> bool:
+                    if local_ctx.source_phase == "pass1":
+                        local_ctx.suggest_targets_called = True
+                        local_ctx.candidate_domains = ["github.com"]
+                        local_ctx.allowed_domains = {"github.com"}
+                        local_ctx.fetch_metadata["fetch-1"] = {
+                            "url": "https://github.com/search?q=Senior+Software+Engineer&type=users",
+                            "final_url": "https://github.com/search?q=Senior+Software+Engineer&type=users",
+                            "title": "User search results · GitHub",
+                            "page_kind": "search_results",
+                            "preview": "results",
+                        }
+                        local_ctx.processed_fetch_ids.add("fetch-1")
+                        return False
+                    writer.saved_count = 3
+                    return True
+
+                fake_client = _FakeClient()
+
+                with (
+                    patch("agent.loop.ollama.AsyncClient", return_value=fake_client),
+                    patch("agent.loop._execute_tool_calls", side_effect=_fake_execute_tool_calls),
+                ):
+                    result = await run_agent_loop(ctx.client_config, "web", ctx)
+
+                self.assertEqual(fake_client.calls, 2)
+                self.assertEqual(ctx.source_phase, "discovery")
+                self.assertIn(result["status"], {"unknown", "completed"})
+            finally:
+                os.chdir(old_cwd)
+
     async def test_run_retries_once_after_recoverable_model_xml_error(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(

@@ -46,6 +46,19 @@ _AVOID_DOMAINS = (
     "producthunt.com",
 )
 
+_HIGH_VOLUME_TECHNICAL_TERMS = (
+    "Staff Engineer",
+    "Staff Software Engineer",
+    "Principal Engineer",
+    "Principal Software Engineer",
+    "Lead Software Engineer",
+    "Senior Backend Engineer",
+    "Senior Frontend Engineer",
+    "Senior Full Stack Engineer",
+    "Platform Engineer",
+    "Distributed Systems Engineer",
+)
+
 
 def suggest_targets(
     client_config: dict,
@@ -119,6 +132,7 @@ def _build_keyword_brief(strategy: str, client_config: dict, source_mode: str) -
     requested_title = str(client_config.get("job_title", "")).strip()
     requested_job = str(client_config.get("job", "")).strip()
     strategy_terms = _strategy_terms(strategy, requested_title, client_config)
+    secondary_limit = 10 if strategy == "technical_profiles" and _lead_target_size(client_config) >= 25 else 3
     primary_terms = _dedupe_terms([requested_title or requested_job or strategy_terms[0]])
     secondary_terms = [
         term
@@ -127,7 +141,7 @@ def _build_keyword_brief(strategy: str, client_config: dict, source_mode: str) -
     ]
     return {
         "primary_terms": primary_terms[:2],
-        "secondary_terms": secondary_terms[:3],
+        "secondary_terms": secondary_terms[:secondary_limit],
         "area": str(client_config.get("area", "NA")).strip() or "NA",
         "source_mode": source_mode,
     }
@@ -159,6 +173,7 @@ def _candidate_targets_for_strategy(
         strategy,
         search_terms,
         area,
+        client_config,
         _enabled_social_platforms(client_config),
         effective_source_mode,
     )
@@ -178,10 +193,38 @@ def _strategy_terms(strategy: str, requested_title: str, client_config: dict) ->
     if strategy == "leadership_people":
         return _dedupe_terms([requested_title, "Founder", "CTO", "Head of Engineering"])
     if strategy == "technical_profiles":
-        return _dedupe_terms([requested_title, "Senior Software Engineer", "Software Engineer", "Architect"])
+        terms = [requested_title, "Senior Software Engineer", "Software Engineer", "Architect"]
+        if _lead_target_size(client_config) >= 25:
+            terms.extend(_HIGH_VOLUME_TECHNICAL_TERMS)
+        return _dedupe_terms(terms)
     if strategy == "marketing_sales_people":
         return _dedupe_terms([requested_title, "Head of Growth", "VP Sales", "Marketing Director"])
     return _dedupe_terms([requested_title, str(client_config.get("job", "")).strip()])
+
+
+def _lead_target_size(client_config: dict) -> int:
+    """Return the configured lead target for this run."""
+    return max(1, int(client_config.get("min_leads", 1) or 1))
+
+
+def _area_variants(area: str, client_config: dict) -> list[str]:
+    """Return a broader set of area variants for large technical runs."""
+    normalized = str(area).strip()
+    if not normalized or normalized.upper() == "NA":
+        return ["NA"]
+
+    variants = [normalized]
+    if _lead_target_size(client_config) < 25:
+        return variants
+
+    lower = normalized.lower()
+    if "san francisco bay area" in lower:
+        variants.extend(["San Francisco", "Bay Area"])
+    elif "san francisco" in lower:
+        variants.append("Bay Area")
+    elif "bay area" in lower:
+        variants.append("San Francisco")
+    return _dedupe_terms(variants)
 
 
 def _social_target_groups(
@@ -373,18 +416,24 @@ def _catalog_for_strategy(
     strategy: str,
     search_terms: list[str],
     area: str,
+    client_config: dict,
     enabled_social_platforms: list[str],
     source_mode: str,
 ) -> list[dict[str, object]]:
     groups: list[dict[str, object]] = []
     if source_mode in {"web", "all"}:
-        groups.extend(_web_target_groups(strategy, search_terms, area))
+        groups.extend(_web_target_groups(strategy, search_terms, area, client_config))
     if source_mode in {"human_emulator", "all"}:
         groups.extend(_social_target_groups(search_terms, area, enabled_social_platforms))
     return groups
 
 
-def _web_target_groups(strategy: str, search_terms: list[str], area: str) -> list[dict[str, object]]:
+def _web_target_groups(
+    strategy: str,
+    search_terms: list[str],
+    area: str,
+    client_config: dict,
+) -> list[dict[str, object]]:
     groups: list[dict[str, object]] = []
 
     if strategy == "leadership_people":
@@ -426,13 +475,22 @@ def _web_target_groups(strategy: str, search_terms: list[str], area: str) -> lis
         return groups
 
     if strategy in {"technical_profiles", "marketing_sales_people", "general_people"}:
+        github_targets: list[dict[str, object]]
+        if strategy == "technical_profiles":
+            github_targets = [
+                _github_search_target(term, area_variant)
+                for area_variant in _area_variants(area, client_config)
+                for term in search_terms
+            ]
+        else:
+            github_targets = [_github_search_target(term, area) for term in search_terms[:3]]
         groups.append(
             {
                 "kind": "web_domain",
                 "identifier": "github.com",
                 "domain": "github.com",
                 "family": "developer_profiles",
-                "targets": [_github_search_target(term, area) for term in search_terms[:3]],
+                "targets": github_targets,
             }
         )
         groups.append(

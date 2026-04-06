@@ -450,6 +450,7 @@ async def dispatch_tool(tool_name: str, arguments: dict, ctx: ToolContext) -> di
 
 def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
     """Return a keyword brief and candidate targets for the current run."""
+    requested_limit = max(1, min(int(limit), 20))
     signature = (
         ctx.source_phase,
         _saved_count(ctx),
@@ -481,7 +482,7 @@ def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
             "strategy": ctx.target_strategy or "unknown",
             "keyword_brief": dict(ctx.keyword_brief),
             "allowed_domains": list(filtered_domains),
-            "candidate_targets": list(filtered_targets[:1]),
+            "candidate_targets": list(filtered_targets[:requested_limit]),
             "message": (
                 "Target brief unchanged in the current source phase. Continue the current viable seed or remaining candidate domains."
                 if filtered_targets
@@ -492,7 +493,7 @@ def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
     result = suggest_targets(
         ctx.client_config,
         ctx.effective_source_mode or ctx.source_mode,
-        limit=max(1, min(int(limit), 20)),
+        limit=_suggest_target_catalog_limit(ctx, requested_limit),
         source_state=ctx.source_state,
         phase=ctx.source_phase,
     )
@@ -500,7 +501,7 @@ def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
         result.get("candidate_targets", []),
         ctx,
     )
-    result["candidate_targets"] = targets
+    result["candidate_targets"] = list(targets[:requested_limit])
     result["allowed_domains"] = _ordered_target_domains(targets)
     ctx.suggest_targets_called = True
     ctx.suggested_targets = list(targets)
@@ -533,6 +534,14 @@ def _tool_suggest_targets(limit: int, ctx: ToolContext) -> dict[str, Any]:
     ]
     ctx.last_suggest_targets_signature = signature
     return result
+
+
+def _suggest_target_catalog_limit(ctx: ToolContext, requested_limit: int) -> int:
+    """Return the internal catalog size to keep on hand for repeated target requests."""
+    min_leads = max(1, int(ctx.client_config.get("min_leads", 1) or 1))
+    if ctx.target_strategy == "technical_profiles" or "engineer" in str(ctx.client_config.get("job", "")).lower():
+        return max(requested_limit, min(80, max(24, min_leads * 2)))
+    return max(requested_limit, min(40, max(12, min_leads)))
 
 
 async def _tool_fetch_page(url: str, needs_javascript: bool, ctx: ToolContext) -> dict:

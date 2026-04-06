@@ -114,7 +114,7 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["strategy"], "technical_profiles")
         self.assertEqual(second["status"], "unchanged")
         self.assertEqual(second["phase"], "pass1")
-        self.assertLessEqual(len(second["candidate_targets"]), 1)
+        self.assertLessEqual(len(second["candidate_targets"]), 4)
 
     async def test_suggest_targets_filters_unavailable_social_domains(self) -> None:
         writer = _DummyWriter()
@@ -200,6 +200,34 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         urls = [target["url"] for target in result["candidate_targets"]]
         self.assertEqual(result["status"], "unchanged")
         self.assertEqual(urls, ["https://duckduckgo.com/html?q=site%3Agithub.com+%22Engineer%22"])
+
+    async def test_unchanged_suggest_targets_returns_next_tranche_from_internal_catalog(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find senior software engineers open to new opportunities",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 100,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+
+        first = await dispatch_tool("suggest_targets", {"limit": 5}, ctx)
+        first_urls = [str(target["url"]) for target in first["candidate_targets"]]
+        self.assertEqual(len(first_urls), 5)
+        for url in first_urls:
+            writer._saved_urls.add(_normalize_url(url))
+
+        second = await dispatch_tool("suggest_targets", {"limit": 5}, ctx)
+        second_urls = [str(target["url"]) for target in second["candidate_targets"]]
+
+        self.assertEqual(second["status"], "unchanged")
+        self.assertTrue(second_urls)
+        self.assertTrue(set(first_urls).isdisjoint(second_urls))
 
     async def test_suggest_targets_filters_duckduckgo_queries_for_banned_follow_on_domains(self) -> None:
         writer = _DummyWriter()

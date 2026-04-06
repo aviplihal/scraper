@@ -188,6 +188,28 @@ class TargetingTests(unittest.TestCase):
         self.assertNotIn("linkedin.com", domains)
         self.assertNotIn("x.com", domains)
 
+    def test_large_technical_run_expands_github_seed_catalog(self) -> None:
+        config = {
+            "client_id": "example_client",
+            "job": "find senior software engineers open to new opportunities",
+            "job_title": "Senior Software Engineer",
+            "area": "San Francisco Bay Area",
+            "website": "NA",
+            "min_leads": 100,
+        }
+
+        result = suggest_targets(config, "web", limit=80, phase="pass1")
+
+        github_urls = [
+            str(target["url"])
+            for target in result["candidate_targets"]
+            if target["domain"] == "github.com"
+        ]
+        self.assertGreaterEqual(len(github_urls), 12)
+        self.assertTrue(any("Staff+Engineer" in url for url in github_urls))
+        self.assertTrue(any("Principal+" in url for url in github_urls))
+        self.assertTrue(any("location%3A%22San+Francisco%22" in url for url in github_urls))
+
 
 if __name__ == "__main__":
     unittest.main()
