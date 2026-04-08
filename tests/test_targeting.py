@@ -61,10 +61,10 @@ class TargetingTests(unittest.TestCase):
             "area": "San Francisco Bay Area",
             "website": "NA",
             "min_leads": 2,
-            "social_platforms": ["linkedin", "x"],
+            "social_platforms": ["linkedin", "x", "instagram", "snapchat"],
         }
 
-        result = suggest_targets(config, "human_emulator", limit=4)
+        result = suggest_targets(config, "human_emulator", limit=8)
 
         self.assertEqual(result["source_mix"], "social_only")
         urls = [target["url"] for target in result["candidate_targets"]]
@@ -72,7 +72,9 @@ class TargetingTests(unittest.TestCase):
         self.assertTrue(all("github.com" not in url and "ycombinator.com" not in url for url in urls))
         self.assertTrue(any("linkedin.com" in url for url in urls))
         self.assertTrue(any("x.com" in url for url in urls))
-        self.assertEqual(set(result["allowed_domains"]), {"linkedin.com", "x.com"})
+        self.assertTrue(any("instagram.com" in url for url in urls))
+        self.assertTrue(any("snapchat.com" in url for url in urls))
+        self.assertEqual(set(result["allowed_domains"]), {"linkedin.com", "x.com", "instagram.com", "snapchat.com"})
 
     def test_pinned_site_targets_stay_on_domain(self) -> None:
         config = {

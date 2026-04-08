@@ -43,8 +43,10 @@ class EmulatorStateTests(unittest.TestCase):
     def test_platform_pause_and_budget_are_independent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch("human_emulator.state.Path", side_effect=lambda value: Path(temp_dir) / value):
-                state = EmulatorState("client", ["linkedin", "x"])
+                state = EmulatorState("client", ["linkedin", "x", "instagram", "snapchat"])
                 state.mark_visited("https://www.linkedin.com/in/alice", platform="linkedin")
+                state.add_profiles(["https://www.instagram.com/alice/"], platform="instagram")
+                state.add_profiles(["https://www.snapchat.com/add/bob"], platform="snapchat")
                 state.set_availability("x", "active", "")
                 state.set_pause_hours("x", hours=8, reason="checkpoint")
 
@@ -55,8 +57,9 @@ class EmulatorStateTests(unittest.TestCase):
             self.assertFalse(paused_linkedin)
             self.assertEqual(state.platform_state("linkedin")["visits_today"], 1)
             self.assertEqual(state.platform_state("x")["visits_today"], 0)
+            self.assertEqual(state.next_profiles("instagram"), ["https://www.instagram.com/alice/"])
+            self.assertEqual(state.next_profiles("snapchat"), ["https://www.snapchat.com/add/bob"])
 
 
 if __name__ == "__main__":
     unittest.main()
-

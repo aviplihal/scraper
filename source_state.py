@@ -41,6 +41,8 @@ SOURCE_ACCURACY_PRESETS: dict[str, dict[str, int]] = {
 _SOCIAL_DOMAINS = {
     "linkedin": "linkedin.com",
     "x": "x.com",
+    "instagram": "instagram.com",
+    "snapchat": "snapchat.com",
 }
 
 

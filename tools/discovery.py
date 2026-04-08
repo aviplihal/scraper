@@ -227,7 +227,15 @@ _GITHUB_RESERVED_SEGMENTS = {
 }
 
 _DUCKDUCKGO_HOSTS = {"duckduckgo.com", "html.duckduckgo.com"}
-_DISCOVERY_PROFILE_DOMAINS = {"github.com", "gitlab.com", "linkedin.com", "x.com", "twitter.com"}
+_DISCOVERY_PROFILE_DOMAINS = {
+    "github.com",
+    "gitlab.com",
+    "instagram.com",
+    "linkedin.com",
+    "snapchat.com",
+    "twitter.com",
+    "x.com",
+}
 
 
 @dataclass(slots=True)

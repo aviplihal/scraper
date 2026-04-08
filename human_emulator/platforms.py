@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from human_emulator.instagram import InstagramAdapter
 from human_emulator.linkedin import LinkedInAdapter
+from human_emulator.snapchat import SnapchatAdapter
 from human_emulator.x import XAdapter
 
 SOCIAL_ADAPTERS = {
     "linkedin": LinkedInAdapter,
     "x": XAdapter,
+    "instagram": InstagramAdapter,
+    "snapchat": SnapchatAdapter,
 }
 
 
@@ -27,4 +31,3 @@ def adapter_for_url(url: str):
 def supported_social_platforms() -> list[str]:
     """Return supported platform names."""
     return list(SOCIAL_ADAPTERS.keys())
-

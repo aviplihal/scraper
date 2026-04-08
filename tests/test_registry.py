@@ -69,6 +69,8 @@ class _FakeEmulatorState:
         self.platform_availability = {
             "linkedin": {"status": "active", "reason": ""},
             "x": {"status": "active", "reason": ""},
+            "instagram": {"status": "active", "reason": ""},
+            "snapchat": {"status": "active", "reason": ""},
         }
         self.added_profiles: list[tuple[str, list[str]]] = []
         self.visited: list[tuple[str, str]] = []
@@ -1078,6 +1080,116 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["page_kind"], "search_results")
         self.assertEqual(state.added_profiles[0], ("x", ["https://x.com/alice"]))
+
+    async def test_instagram_url_routes_through_matching_adapter(self) -> None:
+        writer = _DummyWriter()
+        state = _FakeEmulatorState()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "NA",
+                "min_leads": 1,
+                "social_platforms": ["instagram"],
+            },
+            sheets_writer=writer,
+            source_mode="all",
+            emulator_browser=_FakeEmulatorBrowser(),
+            emulator_state=state,
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"instagram.com"}
+
+        class _FakeInstagramAdapter:
+            platform = "instagram"
+
+            def __init__(self, context, state_arg, client_id: str):  # noqa: ARG002
+                self.context = context
+                self.state = state_arg
+
+            async def fetch(self, url: str) -> SocialFetchResult:
+                return SocialFetchResult(
+                    final_url=url,
+                    title="Instagram Profile",
+                    page_kind="profile",
+                    html=(
+                        "<html><body><h1>Alice Smith</h1>"
+                        "<div class='headline'>Senior Software Engineer</div>"
+                        "<a class='social' href='https://www.instagram.com/alice'>profile</a>"
+                        "</body></html>"
+                    ),
+                    extracted_data={
+                        "name": "Alice Smith",
+                        "job_title": "Senior Software Engineer",
+                        "social_media": url,
+                    },
+                )
+
+        with patch("tools.registry.adapter_for_url", return_value=_FakeInstagramAdapter):
+            result = await dispatch_tool(
+                "fetch_page",
+                {"url": "https://www.instagram.com/alice", "needs_javascript": True},
+                ctx,
+            )
+
+        self.assertEqual(result["page_kind"], "profile")
+        self.assertEqual(ctx.fetch_metadata[result["fetch_id"]]["platform"], "instagram")
+        self.assertEqual(state.visited[0], ("instagram", "https://www.instagram.com/alice"))
+
+    async def test_snapchat_search_fetch_adds_profiles_to_platform_queue(self) -> None:
+        writer = _DummyWriter()
+        state = _FakeEmulatorState()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "NA",
+                "min_leads": 1,
+                "social_platforms": ["snapchat"],
+            },
+            sheets_writer=writer,
+            source_mode="all",
+            emulator_browser=_FakeEmulatorBrowser(),
+            emulator_state=state,
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"snapchat.com"}
+
+        class _FakeSnapchatAdapter:
+            platform = "snapchat"
+
+            def __init__(self, context, state_arg, client_id: str):  # noqa: ARG002
+                self.context = context
+                self.state = state_arg
+
+            async def fetch(self, url: str) -> SocialFetchResult:
+                return SocialFetchResult(
+                    final_url=url,
+                    title="Snapchat People Search",
+                    page_kind="search_results",
+                    html=(
+                        "<html><body>"
+                        "<a href='https://www.snapchat.com/add/alice' data-hovercard-type='user'>Alice Smith</a>"
+                        "</body></html>"
+                    ),
+                    extracted_data={
+                        "results": [
+                            {
+                                "url": "https://www.snapchat.com/add/alice",
+                                "name": "Alice Smith",
+                                "headline": "Senior Software Engineer",
+                            }
+                        ]
+                    },
+                )
+
+        with patch("tools.registry.adapter_for_url", return_value=_FakeSnapchatAdapter):
+            result = await dispatch_tool(
+                "fetch_page",
+                {"url": "https://www.snapchat.com/search/Senior%20Software%20Engineer", "needs_javascript": True},
+                ctx,
+            )
+
+        self.assertEqual(result["page_kind"], "search_results")
+        self.assertEqual(state.added_profiles[0], ("snapchat", ["https://www.snapchat.com/add/alice"]))
 
     async def test_parse_html_rejects_search_pages(self) -> None:
         writer = _DummyWriter()

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import quote, quote_plus, urljoin, urlparse
 
 from source_state import SourceState, infer_source_family, source_key
 
@@ -38,7 +38,8 @@ _MARKETING_SALES_TERMS = (
     "business development",
 )
 
-_SUPPORTED_SOCIAL_PLATFORMS = ("linkedin", "x")
+_SUPPORTED_SOCIAL_PLATFORMS = ("linkedin", "x", "instagram", "snapchat")
+_SOCIAL_DOMAINS = {"linkedin.com", "x.com", "twitter.com", "instagram.com", "snapchat.com"}
 _AVOID_DOMAINS = (
     "crunchbase.com",
     "wellfound.com",
@@ -288,7 +289,7 @@ def _pinned_site_targets(website: str) -> list[dict[str, object]]:
     parsed = urlparse(website if "://" in website else f"https://{website}")
     base = f"{parsed.scheme or 'https'}://{parsed.netloc or parsed.path}".rstrip("/")
     domain = _domain_for_url(base)
-    source = "social" if domain in {"linkedin.com", "x.com", "twitter.com"} else "web"
+    source = "social" if domain in _SOCIAL_DOMAINS else "web"
     paths = [
         "",
         "/people",
@@ -377,6 +378,24 @@ def _social_search_target(platform: str, term: str, area: str) -> dict[str, obje
             reason=f"Enabled social user search matching '{query}'.",
             source_kind="social_platform",
             source_id="x",
+        )
+    if platform == "instagram":
+        return _candidate_target(
+            f"https://www.instagram.com/explore/search/keyword/?q={quote_plus(query)}",
+            source="social",
+            family="people_search",
+            reason=f"Enabled Instagram people search matching '{query}'.",
+            source_kind="social_platform",
+            source_id="instagram",
+        )
+    if platform == "snapchat":
+        return _candidate_target(
+            f"https://www.snapchat.com/search/{quote(query)}",
+            source="social",
+            family="people_search",
+            reason=f"Enabled Snapchat people search matching '{query}'.",
+            source_kind="social_platform",
+            source_id="snapchat",
         )
     return None
 

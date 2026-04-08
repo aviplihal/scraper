@@ -56,6 +56,8 @@ _GENERIC_PROFILE_SELECTORS: dict[str, list[str]] = {
         "a[href*='linkedin.com']",
         "a[href*='twitter.com']",
         "a[href*='x.com']",
+        "a[href*='instagram.com']",
+        "a[href*='snapchat.com']",
         "a[href*='github.com']",
     ],
 }
@@ -82,13 +84,28 @@ _LOW_QUALITY_COMPANY_VALUES = {
 
 # Social-media domains that must be routed to the human emulator
 SOCIAL_MEDIA_DOMAINS: frozenset[str] = frozenset(
-    ["linkedin.com", "facebook.com", "instagram.com", "twitter.com", "x.com"]
+    ["linkedin.com", "facebook.com", "instagram.com", "snapchat.com", "twitter.com", "x.com"]
 )
+_SUPPORTED_SOCIAL_PROFILE_DOMAINS: frozenset[str] = frozenset(
+    ["linkedin.com", "instagram.com", "snapchat.com", "twitter.com", "x.com"]
+)
+_SOCIAL_PLATFORM_BY_DOMAIN: dict[str, str] = {
+    "linkedin.com": "linkedin",
+    "instagram.com": "instagram",
+    "snapchat.com": "snapchat",
+    "twitter.com": "x",
+    "x.com": "x",
+}
 
 
 def _is_social_media(url: str) -> bool:
     url_lower = url.lower()
     return any(domain in url_lower for domain in SOCIAL_MEDIA_DOMAINS)
+
+
+def _social_platform_for_domain(domain: str) -> str | None:
+    """Return the configured platform key for a supported social domain."""
+    return _SOCIAL_PLATFORM_BY_DOMAIN.get(domain)
 
 
 @dataclass
@@ -972,7 +989,7 @@ async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
             ctx.rejected_weak_count += 1
             source_stats.rejected_count += 1
             _mark_terminal_url(url, "rejected", ctx)
-            if _domain_for_url(url) in {"linkedin.com", "x.com", "twitter.com"}:
+            if _domain_for_url(url) in _SUPPORTED_SOCIAL_PROFILE_DOMAINS:
                 _record_social_blank_profile(url, ctx)
         logger.info("Rejected weak lead: %s — %s", url, reason)
         print(f"  • Weak lead rejected: {data.get('name') or url} ({reason})", flush=True)
@@ -993,10 +1010,9 @@ async def _tool_save_result(url: str, data: dict, ctx: ToolContext) -> dict:
                 _record_saved_lead(url, data, source_status, source_stats.family, ctx)
                 _mark_terminal_url(url, "saved", ctx)
                 social_domain = _domain_for_url(url)
-                if social_domain == "linkedin.com":
-                    ctx.social_platform_saves["linkedin"] = ctx.social_platform_saves.get("linkedin", 0) + 1
-                elif social_domain in {"x.com", "twitter.com"}:
-                    ctx.social_platform_saves["x"] = ctx.social_platform_saves.get("x", 0) + 1
+                social_platform = _social_platform_for_domain(social_domain)
+                if social_platform:
+                    ctx.social_platform_saves[social_platform] = ctx.social_platform_saves.get(social_platform, 0) + 1
             print(f"  ✓ Saved: {data.get('name') or url}", flush=True)
         else:
             async with ctx.state_lock:
@@ -1138,10 +1154,9 @@ def _search_seed_for_url(url: str, ctx: ToolContext) -> str:
 def _record_social_blank_profile(url: str, ctx: ToolContext) -> None:
     """Track blank/low-yield social profiles by seed and platform."""
     domain = _domain_for_url(url)
-    if domain not in {"linkedin.com", "x.com", "twitter.com"}:
+    platform = _social_platform_for_domain(domain)
+    if not platform:
         return
-
-    platform = "x" if domain in {"x.com", "twitter.com"} else "linkedin"
     seed_fetch_id = _search_seed_for_url(url, ctx)
     if seed_fetch_id:
         ctx.social_blank_seed_counts[seed_fetch_id] = ctx.social_blank_seed_counts.get(seed_fetch_id, 0) + 1
@@ -1155,12 +1170,8 @@ def _record_social_blank_profile(url: str, ctx: ToolContext) -> None:
 
 def _is_low_yield_platform(url: str, ctx: ToolContext) -> bool:
     """Return True when a social platform is on run-local low-yield cooldown."""
-    domain = _domain_for_url(url)
-    if domain == "linkedin.com":
-        return "linkedin" in ctx.low_yield_platforms
-    if domain in {"x.com", "twitter.com"}:
-        return "x" in ctx.low_yield_platforms
-    return False
+    platform = _social_platform_for_domain(_domain_for_url(url))
+    return bool(platform and platform in ctx.low_yield_platforms)
 
 
 def _saved_count(ctx: ToolContext) -> int:
@@ -1178,7 +1189,7 @@ def _fetch_budget_for_url(url: str, ctx: ToolContext) -> int:
         return max(24, min_leads * 6)
     if budget_key == "duckduckgo.com:search":
         return max(6, min(12, min_leads))
-    if budget_key in {"linkedin.com:social", "x.com:social", "twitter.com:social"}:
+    if budget_key.endswith(":social"):
         return max(6, min_leads * 2)
     domain = _domain_for_url(url)
     return _MAX_FETCHES_PER_DOMAIN
@@ -1197,7 +1208,7 @@ def _fetch_budget_key(url: str) -> str:
         return "github.com:profile"
     if domain == "duckduckgo.com":
         return "duckduckgo.com:search"
-    if domain in {"linkedin.com", "x.com", "twitter.com"}:
+    if domain in _SUPPORTED_SOCIAL_PROFILE_DOMAINS:
         return f"{domain}:social"
     return domain
 
@@ -1252,9 +1263,8 @@ def _filter_candidate_targets(targets: list[dict[str, Any]], ctx: ToolContext) -
                     continue
                 if _persistent_source_excluded_for_discovery(site_domain, ctx):
                     continue
-        if domain == "linkedin.com" and "linkedin" in ctx.low_yield_platforms:
-            continue
-        if domain in {"x.com", "twitter.com"} and "x" in ctx.low_yield_platforms:
+        platform = _social_platform_for_domain(domain)
+        if platform and platform in ctx.low_yield_platforms:
             continue
         if _normalize_url(url) in ctx.exhausted_discovery_urls:
             continue
@@ -1546,7 +1556,7 @@ def _record_domain_failure(url: str, reason: str, ctx: ToolContext) -> None:
     else:
         outcome.irrelevant_count += 1
         outcome.last_reason = reason
-    if _domain_for_url(url) in {"linkedin.com", "x.com", "twitter.com"}:
+    if _domain_for_url(url) in _SUPPORTED_SOCIAL_PROFILE_DOMAINS:
         _record_social_blank_profile(url, ctx)
     if fetch_id:
         ctx.accounted_fetch_ids.add(fetch_id)
@@ -1747,10 +1757,9 @@ async def _flush_sampled_leads(
                 _record_saved_lead(url, data, source_status, source_family, ctx)
                 _mark_terminal_url(url, "saved", ctx)
                 social_domain = _domain_for_url(url)
-                if social_domain == "linkedin.com":
-                    ctx.social_platform_saves["linkedin"] = ctx.social_platform_saves.get("linkedin", 0) + 1
-                elif social_domain in {"x.com", "twitter.com"}:
-                    ctx.social_platform_saves["x"] = ctx.social_platform_saves.get("x", 0) + 1
+                social_platform = _social_platform_for_domain(social_domain)
+                if social_platform:
+                    ctx.social_platform_saves[social_platform] = ctx.social_platform_saves.get(social_platform, 0) + 1
             print(f"  ✓ Saved: {data.get('name') or url}", flush=True)
         else:
             async with ctx.state_lock:
@@ -2361,7 +2370,7 @@ def _normalize_social_value(value: Any, source_url: str) -> Any:
         return f"https://{text}"
     if text.startswith("http://") or text.startswith("https://"):
         return text
-    if _domain_for_url(source_url) in {"linkedin.com", "x.com", "twitter.com"}:
+    if _domain_for_url(source_url) in _SUPPORTED_SOCIAL_PROFILE_DOMAINS:
         return source_url
     return text
 
@@ -2425,7 +2434,7 @@ def _humanize_org_token(value: str) -> str:
 def _looks_like_social_profile_url(value: str) -> bool:
     """Return True when a value already points at a social/profile URL."""
     domain = _domain_for_url(value)
-    return domain in {"linkedin.com", "x.com", "twitter.com", "github.com", "gitlab.com"}
+    return domain in {*_SUPPORTED_SOCIAL_PROFILE_DOMAINS, "github.com", "gitlab.com"}
 
 
 def _is_minimally_viable_lead(data: dict[str, Any], source_url: str) -> tuple[bool, str]:
@@ -2457,7 +2466,7 @@ def _is_minimally_viable_lead(data: dict[str, Any], source_url: str) -> tuple[bo
 def _is_blank_social_profile_data(source_url: str, data: dict[str, Any]) -> bool:
     """Return True when a social profile has no meaningful person or support fields."""
     domain = _domain_for_url(source_url)
-    if domain not in {"linkedin.com", "x.com", "twitter.com"}:
+    if domain not in _SUPPORTED_SOCIAL_PROFILE_DOMAINS:
         return False
 
     name = data.get("name")
@@ -2574,6 +2583,8 @@ def _coerce_fetch_page_args(arguments: dict[str, Any], ctx: ToolContext) -> tupl
         domain = _domain_for_url(url)
         needs_javascript = domain in {
             "linkedin.com",
+            "instagram.com",
+            "snapchat.com",
             "x.com",
             "twitter.com",
             "github.com",
@@ -2662,7 +2673,7 @@ def _postprocess_extracted_fields(
         if job_title and username and str(job_title).strip() == username:
             result["job_title"] = derived_title
 
-    if domain in {"linkedin.com", "x.com", "twitter.com"}:
+    if domain in _SUPPORTED_SOCIAL_PROFILE_DOMAINS:
         extracted_data = metadata.get("extracted_data", {})
         if not isinstance(extracted_data, dict):
             extracted_data = {}

@@ -33,17 +33,17 @@ class RunJobValidationTests(unittest.TestCase):
         config = {
             "client_id": "example_client",
             "min_leads": 1,
-            "social_platforms": ["linkedin", "x"],
+            "social_platforms": ["linkedin", "x", "instagram", "snapchat"],
         }
 
         _validate_config(config, "example_client")
-        self.assertEqual(config["social_platforms"], ["linkedin", "x"])
+        self.assertEqual(config["social_platforms"], ["linkedin", "x", "instagram", "snapchat"])
 
     def test_validate_config_rejects_unknown_social_platform(self) -> None:
         config = {
             "client_id": "example_client",
             "min_leads": 1,
-            "social_platforms": ["linkedin", "instagram"],
+            "social_platforms": ["linkedin", "tiktok"],
         }
 
         with self.assertRaisesRegex(ValueError, "Unsupported social platform"):

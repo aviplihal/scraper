@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 DAILY_VISIT_LIMIT = 75
-DEFAULT_PLATFORMS = ("linkedin", "x")
+DEFAULT_PLATFORMS = ("linkedin", "x", "instagram", "snapchat")
 
 
 class EmulatorState:
@@ -277,5 +277,8 @@ def _infer_platform_from_url(url: str) -> str:
         return "linkedin"
     if host.endswith("x.com") or host.endswith("twitter.com"):
         return "x"
+    if host.endswith("instagram.com"):
+        return "instagram"
+    if host.endswith("snapchat.com"):
+        return "snapchat"
     return "linkedin"
-
