@@ -581,6 +581,67 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_pass1_reseed_waits_for_existing_starter_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "job": "find senior software engineers open to new opportunities",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 100,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "job": "find senior software engineers open to new opportunities",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 100,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="pass1",
+                    target_strategy="technical_profiles",
+                )
+                ctx.suggest_targets_called = True
+                ctx.allowed_domains = {"github.com"}
+                ctx.candidate_domains = ["github.com"]
+                ctx.suggested_targets = [
+                    {
+                        "url": "https://github.com/search?q=Senior+Software+Engineer&type=users",
+                        "domain": "github.com",
+                    }
+                ]
+                ctx.current_run_saved_leads = [
+                    {
+                        "url": "https://github.com/alice",
+                        "data": {"name": "Alice", "job_title": "Staff Software Engineer at Box"},
+                        "source_status": "approved",
+                    },
+                ]
+
+                messages: list[dict] = []
+                reseeded = _maybe_reseed_target_pool(ctx, messages)
+
+                self.assertFalse(reseeded)
+                self.assertTrue(ctx.suggest_targets_called)
+                self.assertEqual(ctx.allowed_domains, {"github.com"})
+                self.assertEqual(messages, [])
+            finally:
+                os.chdir(old_cwd)
+
     async def test_auto_fail_remaining_non_actionable_pages_marks_pages_processed(self) -> None:
         writer = _DummyWriter()
         ctx = ToolContext(

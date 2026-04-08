@@ -959,6 +959,15 @@ def _maybe_switch_to_discovery_phase(ctx: ToolContext, messages: list[dict]) -> 
 
 def _maybe_reseed_target_pool(ctx: ToolContext, messages: list[dict]) -> bool:
     """Refresh pass1 starter targets from baseline approved leads before giving up."""
+    if (
+        _unprocessed_fetch_ids(ctx)
+        or _remaining_discovery_fetch_ids(ctx)
+        or _remaining_discovered_profile_urls(ctx)
+        or _remaining_candidate_target_urls(ctx)
+        or _remaining_candidate_domains(ctx)
+    ):
+        return False
+
     reseed = _prepare_target_reseed(ctx)
     if not reseed:
         return False
