@@ -26,6 +26,9 @@ from tools.registry import (
     _fetch_budget_key,
     _normalize_url,
     dispatch_tool,
+    _same_or_subdomain,
+    _social_platform_for_domain,
+    _uses_curated_target_pool,
 )
 
 logger = logging.getLogger(__name__)
@@ -1072,12 +1075,7 @@ def _remaining_candidate_domains(ctx: ToolContext) -> list[str]:
     remaining: list[str] = []
     fetched_domains = _fetched_candidate_domains(ctx)
     for domain in ctx.candidate_domains or sorted(ctx.allowed_domains):
-        if domain in getattr(ctx, "unavailable_domains", set()):
-            continue
-        outcome = ctx.domain_outcomes.get(domain)
-        if outcome and outcome.banned_for_run:
-            continue
-        if _domain_on_low_yield_cooldown(domain, ctx):
+        if _domain_not_actionable(domain, ctx):
             continue
         if _domain_budget_exhausted(domain, ctx):
             continue
@@ -1100,7 +1098,8 @@ def _remaining_candidate_target_urls(ctx: ToolContext) -> list[str]:
         domain = _domain_for_url(url)
         if (
             normalized_url in seen
-            or domain in getattr(ctx, "unavailable_domains", set())
+            or _domain_not_actionable(domain, ctx)
+            or _starter_target_outside_current_pool(domain, ctx)
             or _url_budget_exhausted(url, ctx)
             or normalized_url in getattr(ctx, "exhausted_discovery_urls", set())
             or normalized_url in getattr(ctx, "url_to_fetch_id", {})
@@ -1141,17 +1140,59 @@ def _remaining_discovered_profile_urls(ctx: ToolContext) -> list[str]:
             continue
         if _url_budget_exhausted(normalized_url, ctx):
             continue
+        domain = _domain_for_url(normalized_url)
+        if _domain_not_actionable(domain, ctx):
+            continue
+        if _discovered_url_outside_current_pool(normalized_url, parent_fetch_id, ctx):
+            continue
         ready.append(normalized_url)
     return ready
 
 
+def _domain_not_actionable(domain: str, ctx: ToolContext) -> bool:
+    """Return True when a domain would be rejected before a useful fetch."""
+    if not domain:
+        return True
+    if domain in getattr(ctx, "unavailable_domains", set()):
+        return True
+    if domain in getattr(ctx, "avoid_domains", set()):
+        return True
+    outcome = ctx.domain_outcomes.get(domain)
+    if outcome and outcome.banned_for_run:
+        return True
+    return _domain_on_low_yield_cooldown(domain, ctx)
+
+
+def _starter_target_outside_current_pool(domain: str, ctx: ToolContext) -> bool:
+    """Return True when a stale starter target no longer belongs to the active pool."""
+    return (
+        _uses_curated_target_pool(ctx)
+        and ctx.suggest_targets_called
+        and (not ctx.allowed_domains or domain not in ctx.allowed_domains)
+    )
+
+
+def _discovered_url_outside_current_pool(normalized_url: str, parent_fetch_id: str, ctx: ToolContext) -> bool:
+    """Return True when a discovered follow-on URL is stale for the current target pool."""
+    if not _uses_curated_target_pool(ctx) or not ctx.suggest_targets_called:
+        return False
+    if not ctx.allowed_domains:
+        return True
+
+    domain = _domain_for_url(normalized_url)
+    if domain in ctx.allowed_domains:
+        return False
+
+    metadata = ctx.fetch_metadata.get(parent_fetch_id, {})
+    parent_url = str(metadata.get("final_url") or metadata.get("url") or "")
+    parent_domain = _domain_for_url(parent_url)
+    return not any(_same_or_subdomain(parent_domain, allowed_domain) for allowed_domain in ctx.allowed_domains)
+
+
 def _domain_on_low_yield_cooldown(domain: str, ctx: ToolContext) -> bool:
     """Return True when a domain maps to a run-local low-yield social platform."""
-    if domain == "linkedin.com" and "linkedin" in getattr(ctx, "low_yield_platforms", set()):
-        return True
-    if domain in {"x.com", "twitter.com"} and "x" in getattr(ctx, "low_yield_platforms", set()):
-        return True
-    return False
+    platform = _social_platform_for_domain(domain)
+    return bool(platform and platform in getattr(ctx, "low_yield_platforms", set()))
 
 
 def _candidate_preview_urls(ctx: ToolContext, limit: int = 3) -> list[str]:

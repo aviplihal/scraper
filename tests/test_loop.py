@@ -16,6 +16,7 @@ from agent.loop import (
     _normalized_tool_name,
     _maybe_compact_messages,
     _no_viable_next_actions,
+    _remaining_discovered_profile_urls,
     _try_automatic_profile_processing,
     run_agent_loop,
 )
@@ -374,6 +375,8 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
             source_mode="web",
         )
         ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"github.com"}
+        ctx.candidate_domains = ["github.com"]
         ctx.fetch_metadata["fetch-search"] = {
             "url": "https://github.com/search?q=engineer&type=users",
             "final_url": "https://github.com/search?q=engineer&type=users",
@@ -389,6 +392,67 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Fetch the discovered profile/detail URLs", reminder)
         self.assertIn("https://github.com/alice-smith", reminder)
+
+    def test_discovered_profile_urls_skip_domains_removed_from_current_pool(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 3,
+            },
+            sheets_writer=writer,
+            source_mode="all",
+            source_phase="discovery",
+        )
+        ctx.suggest_targets_called = True
+        ctx.fetch_metadata["fetch-linkedin"] = {
+            "url": "https://www.linkedin.com/search/results/people/?keywords=Senior+Software+Engineer",
+            "final_url": "https://www.linkedin.com/search/results/people/?keywords=Senior+Software+Engineer",
+            "page_kind": "search_results",
+            "title": "LinkedIn search",
+            "preview": "results",
+        }
+        ctx.processed_fetch_ids.add("fetch-linkedin")
+        ctx.exhausted_discovery_fetches.add("fetch-linkedin")
+        ctx.discovered_link_parents["https://linkedin.com/in/carmenmeneses"] = "fetch-linkedin"
+
+        self.assertEqual(_remaining_discovered_profile_urls(ctx), [])
+        self.assertTrue(_no_viable_next_actions(ctx))
+
+    def test_discovered_profile_urls_skip_low_yield_social_domains(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find engineers",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 3,
+            },
+            sheets_writer=writer,
+            source_mode="all",
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"github.com", "linkedin.com"}
+        ctx.candidate_domains = ["github.com", "linkedin.com"]
+        ctx.low_yield_platforms.add("linkedin")
+        ctx.fetch_metadata["fetch-linkedin"] = {
+            "url": "https://www.linkedin.com/search/results/people/?keywords=Senior+Software+Engineer",
+            "final_url": "https://www.linkedin.com/search/results/people/?keywords=Senior+Software+Engineer",
+            "page_kind": "search_results",
+            "title": "LinkedIn search",
+            "preview": "results",
+        }
+        ctx.processed_fetch_ids.add("fetch-linkedin")
+        ctx.exhausted_discovery_fetches.add("fetch-linkedin")
+        ctx.discovered_link_parents["https://linkedin.com/in/carmenmeneses"] = "fetch-linkedin"
+
+        self.assertEqual(_remaining_discovered_profile_urls(ctx), [])
 
     def test_no_viable_next_actions_when_all_candidate_urls_are_budget_exhausted(self) -> None:
         writer = _DummyWriter()
@@ -641,6 +705,64 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(messages, [])
             finally:
                 os.chdir(old_cwd)
+
+    def test_pass1_reseed_ignores_stale_low_yield_social_profiles(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "job": "find senior software engineers open to new opportunities",
+                "job_title": "Senior Software Engineer",
+                "area": "San Francisco Bay Area",
+                "website": "NA",
+                "min_leads": 100,
+            },
+            sheets_writer=writer,
+            source_mode="all",
+            source_phase="pass1",
+            target_strategy="technical_profiles",
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"github.com", "linkedin.com"}
+        ctx.candidate_domains = ["github.com", "linkedin.com"]
+        ctx.low_yield_platforms.add("linkedin")
+        ctx.fetch_metadata["fetch-github"] = {
+            "url": "https://github.com/search?q=Senior+Software+Engineer&type=users",
+            "final_url": "https://github.com/search?q=Senior+Software+Engineer&type=users",
+            "page_kind": "search_results",
+            "title": "GitHub search",
+            "preview": "results",
+        }
+        ctx.fetch_metadata["fetch-linkedin"] = {
+            "url": "https://www.linkedin.com/search/results/people/?keywords=Senior+Software+Engineer",
+            "final_url": "https://www.linkedin.com/search/results/people/?keywords=Senior+Software+Engineer",
+            "page_kind": "search_results",
+            "title": "LinkedIn search",
+            "preview": "results",
+        }
+        ctx.exhausted_discovery_fetches.update({"fetch-github", "fetch-linkedin"})
+        ctx.processed_fetch_ids.update({"fetch-github", "fetch-linkedin"})
+        ctx.discovered_link_parents["https://linkedin.com/in/carmenmeneses"] = "fetch-linkedin"
+        ctx.current_run_saved_leads = [
+            {
+                "url": "https://github.com/muneeb",
+                "data": {"name": "Muneeb", "job_title": "Senior Software Engineer | Kubernetes"},
+                "source_status": "approved",
+            },
+            {
+                "url": "https://github.com/chris",
+                "data": {"name": "Chris", "job_title": "Software Engineer"},
+                "source_status": "approved",
+            },
+        ]
+
+        messages: list[dict] = []
+        reseeded = _maybe_reseed_target_pool(ctx, messages)
+
+        self.assertTrue(reseeded)
+        self.assertFalse(ctx.suggest_targets_called)
+        self.assertIn("Staff Engineer", ctx.reseed_search_terms)
+        self.assertIn("call suggest_targets again", messages[0]["content"])
 
     async def test_auto_fail_remaining_non_actionable_pages_marks_pages_processed(self) -> None:
         writer = _DummyWriter()
