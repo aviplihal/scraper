@@ -934,6 +934,119 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_pass1_discovery_switch_waits_for_discovered_profile_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "job": "find engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "job": "find engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="pass1",
+                )
+                ctx.suggest_targets_called = True
+                ctx.allowed_domains = {"github.com"}
+                ctx.candidate_domains = ["github.com"]
+                ctx.fetch_metadata["fetch-search"] = {
+                    "url": "https://github.com/search?q=Staff+Engineer&type=users",
+                    "final_url": "https://github.com/search?q=Staff+Engineer&type=users",
+                    "title": "User search results · GitHub",
+                    "page_kind": "search_results",
+                    "preview": "results",
+                }
+                ctx.processed_fetch_ids.add("fetch-search")
+                ctx.exhausted_discovery_fetches.add("fetch-search")
+                ctx.exhausted_discovery_urls.add("https://github.com/search?q=Staff+Engineer&type=users")
+                ctx.discovered_link_parents["https://github.com/MadebyAe"] = "fetch-search"
+
+                messages: list[dict] = []
+                switched = _maybe_switch_to_discovery_phase(ctx, messages)
+
+                self.assertFalse(switched)
+                self.assertEqual(ctx.source_phase, "pass1")
+                self.assertEqual(messages, [])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_pass1_discovery_switch_runs_when_no_actionable_work_remains(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tempdir)
+                writer = _DummyWriter()
+                state = SourceState(
+                    "test",
+                    {
+                        "client_id": "test",
+                        "job": "find engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                )
+                ctx = ToolContext(
+                    client_config={
+                        "client_id": "test",
+                        "job": "find engineers",
+                        "job_title": "Senior Software Engineer",
+                        "area": "San Francisco Bay Area",
+                        "website": "NA",
+                        "min_leads": 3,
+                        "approved_sources": {"web_domains": ["github.com"], "social_platforms": []},
+                    },
+                    sheets_writer=writer,
+                    source_mode="web",
+                    source_state=state,
+                    source_phase="pass1",
+                )
+                ctx.suggest_targets_called = True
+                ctx.allowed_domains = {"github.com"}
+                ctx.candidate_domains = ["github.com"]
+                ctx.fetch_metadata["fetch-search"] = {
+                    "url": "https://github.com/search?q=Staff+Engineer&type=users",
+                    "final_url": "https://github.com/search?q=Staff+Engineer&type=users",
+                    "title": "User search results · GitHub",
+                    "page_kind": "search_results",
+                    "preview": "results",
+                }
+                ctx.processed_fetch_ids.add("fetch-search")
+                ctx.exhausted_discovery_fetches.add("fetch-search")
+                ctx.exhausted_discovery_urls.add("https://github.com/search?q=Staff+Engineer&type=users")
+
+                messages: list[dict] = []
+                switched = _maybe_switch_to_discovery_phase(ctx, messages)
+
+                self.assertTrue(switched)
+                self.assertEqual(ctx.source_phase, "discovery")
+                self.assertIn("Start pass 2 now", messages[0]["content"])
+            finally:
+                os.chdir(old_cwd)
+
     async def test_run_switches_to_discovery_after_tool_batch_exhausts_pass1(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             old_cwd = os.getcwd()
@@ -1011,6 +1124,10 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
                             "preview": "results",
                         }
                         local_ctx.processed_fetch_ids.add("fetch-1")
+                        local_ctx.exhausted_discovery_fetches.add("fetch-1")
+                        local_ctx.exhausted_discovery_urls.add(
+                            "https://github.com/search?q=Senior+Software+Engineer&type=users"
+                        )
                         return False
                     writer.saved_count = 3
                     return True

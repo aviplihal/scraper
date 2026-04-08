@@ -926,6 +926,8 @@ def _maybe_switch_to_discovery_phase(ctx: ToolContext, messages: list[dict]) -> 
         return False
     if _lead_target_reached(ctx):
         return False
+    if _has_actionable_work(ctx):
+        return False
     pass1_exhausted = _curated_target_pool_exhausted(ctx)
     if ctx.suggest_targets_called and not (ctx.candidate_domains or ctx.allowed_domains):
         pass1_exhausted = True
@@ -1296,7 +1298,12 @@ def _domain_budget_exhausted(domain: str, ctx: ToolContext) -> bool:
 
 def _no_viable_next_actions(ctx: ToolContext) -> bool:
     """Return True when the run has no actionable fetched pages or fetchable next URLs left."""
-    return not (
+    return not _has_actionable_work(ctx)
+
+
+def _has_actionable_work(ctx: ToolContext) -> bool:
+    """Return True when existing pass work should be handled before phase changes."""
+    return bool(
         _unprocessed_fetch_ids(ctx)
         or _remaining_discovery_fetch_ids(ctx)
         or _remaining_discovered_profile_urls(ctx)
