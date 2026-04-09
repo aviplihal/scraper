@@ -17,6 +17,7 @@ from agent.loop import (
     _maybe_compact_messages,
     _no_viable_next_actions,
     _remaining_discovered_profile_urls,
+    _try_automatic_follow_through_actions,
     _try_automatic_profile_processing,
     run_agent_loop,
 )
@@ -174,6 +175,72 @@ class LoopFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(processed)
         self.assertEqual(writer.saved_count, 3)
+
+    async def test_automatic_follow_through_lists_outstanding_search_page(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "NA",
+                "min_leads": 10,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.page_cache["fetch-search"] = """
+        <html><body><a href="https://github.com/alice-smith">Alice Smith</a></body></html>
+        """
+        ctx.fetch_metadata["fetch-search"] = {
+            "url": "https://github.com/search?q=engineer&type=users",
+            "final_url": "https://github.com/search?q=engineer&type=users",
+            "title": "Search",
+            "page_kind": "search_results",
+            "preview": "results",
+        }
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"github.com"}
+        ctx.candidate_domains = ["github.com"]
+
+        processed = await _try_automatic_follow_through_actions(ctx, [], step=3)
+
+        self.assertTrue(processed)
+        self.assertIn("https://github.com/alice-smith", ctx.discovered_link_parents)
+        self.assertIn("fetch-search", ctx.processed_fetch_ids)
+
+    async def test_automatic_follow_through_fetches_discovered_profile_urls(self) -> None:
+        writer = _DummyWriter()
+        ctx = ToolContext(
+            client_config={
+                "client_id": "test",
+                "website": "NA",
+                "min_leads": 10,
+            },
+            sheets_writer=writer,
+            source_mode="web",
+        )
+        ctx.suggest_targets_called = True
+        ctx.allowed_domains = {"github.com"}
+        ctx.candidate_domains = ["github.com"]
+        ctx.fetch_metadata["fetch-search"] = {
+            "url": "https://github.com/search?q=engineer&type=users",
+            "final_url": "https://github.com/search?q=engineer&type=users",
+            "title": "Search",
+            "page_kind": "search_results",
+            "preview": "results",
+        }
+        ctx.processed_fetch_ids.add("fetch-search")
+        ctx.discovered_link_parents["https://github.com/alice-smith"] = "fetch-search"
+        ctx.discovered_link_parents["https://github.com/bob-jones"] = "fetch-search"
+
+        async def _fake_dispatch(tool_name: str, arguments: dict, _ctx: ToolContext) -> dict:
+            self.assertEqual(tool_name, "fetch_page")
+            return {"fetch_id": f"fetch:{arguments['url']}", "url": arguments["url"], "page_kind": "profile"}
+
+        with patch("agent.loop.dispatch_tool", side_effect=_fake_dispatch) as mock_dispatch:
+            processed = await _try_automatic_follow_through_actions(ctx, [], step=4)
+
+        self.assertTrue(processed)
+        self.assertEqual(mock_dispatch.call_count, 2)
 
     def test_follow_through_reminder_includes_target_progress(self) -> None:
         writer = _DummyWriter()

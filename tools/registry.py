@@ -1429,6 +1429,12 @@ def _broad_mode_rejection(url: str, normalized_url: str, domain: str, ctx: ToolC
             "Use the suggest_targets brief instead of inventing new domains."
         )
 
+    if _invented_direct_profile_url(url, normalized_url, domain, ctx):
+        return (
+            "Direct profile/detail URLs on allowed domains must come from suggest_targets or list_links. "
+            "Use a suggested search seed or a discovered profile URL instead of inventing handles."
+        )
+
     denied_reason = _broad_mode_denied_url(url)
     if denied_reason:
         return denied_reason
@@ -1459,6 +1465,53 @@ def _allow_discovered_follow_on_url(normalized_url: str, domain: str, ctx: ToolC
     if _persistent_source_excluded_for_discovery(domain, ctx):
         return False
     return True
+
+
+def _invented_direct_profile_url(url: str, normalized_url: str, domain: str, ctx: ToolContext) -> bool:
+    """Return True when a direct profile URL was invented instead of discovered."""
+    if normalized_url in ctx.suggested_target_urls:
+        return False
+    if _allow_discovered_follow_on_url(normalized_url, domain, ctx):
+        return False
+    return _is_profile_like_url(url, domain)
+
+
+def _is_profile_like_url(url: str, domain: str) -> bool:
+    """Return True for direct profile/detail URLs that should be sourced, not invented."""
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    path_parts = [part for part in parsed.path.split("/") if part]
+
+    if domain == "github.com":
+        reserved = {
+            "about",
+            "account",
+            "collections",
+            "contact",
+            "customer-stories",
+            "enterprise",
+            "events",
+            "explore",
+            "features",
+            "issues",
+            "login",
+            "marketplace",
+            "notifications",
+            "orgs",
+            "organizations",
+            "pricing",
+            "pulls",
+            "search",
+            "sessions",
+            "settings",
+            "site",
+            "sponsors",
+            "topics",
+            "trending",
+            "users",
+        }
+        return len(path_parts) == 1 and path_parts[0].lower() not in reserved
+
+    return False
 
 
 def _broad_mode_denied_url(url: str) -> str | None:

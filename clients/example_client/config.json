@@ -4,7 +4,7 @@
   "job_title": "Senior Software Engineer",
   "area": "San Francisco Bay Area",
   "website": "NA",
-  "min_leads": 3,
+  "min_leads": 100,
   "source_accuracy": "balanced",
   "approved_sources": {
     "web_domains": ["github.com"],

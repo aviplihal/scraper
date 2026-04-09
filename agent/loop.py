@@ -40,6 +40,8 @@ _MESSAGE_COMPACT_THRESHOLD = 12
 _MESSAGE_COMPACT_HARD_THRESHOLD = 22
 _COMPACTION_MIN_NEW_MESSAGES = 10
 _AUTO_PROFILE_BATCH_SIZE = 3
+_AUTO_DISCOVERY_FETCH_BATCH_SIZE = 5
+_AUTO_LIST_LINK_BATCH_SIZE = 2
 _FAKE_TOOL_CALL_PATTERN = re.compile(
     r"\b(fetch_page|fetch_url|list_links|parse_html|save_result|fail_url|suggest_targets|search|finish_run|finish_job)\s*\("
 )
@@ -155,6 +157,26 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                 if _should_request_follow_through(ctx):
                     continue
 
+            if await _try_automatic_follow_through_actions(ctx, messages, step):
+                if _lead_target_reached(ctx):
+                    print(
+                        f"\n[agent] Lead target reached after step {step} — job stopped.",
+                        flush=True,
+                    )
+                    run_result["status"] = "completed"
+                    run_result["stop_reason"] = _lead_target_stop_reason(ctx)
+                    break
+                if await _try_automatic_profile_processing(ctx, messages, step):
+                    if _lead_target_reached(ctx):
+                        print(
+                            f"\n[agent] Lead target reached after step {step} — job stopped.",
+                            flush=True,
+                        )
+                        run_result["status"] = "completed"
+                        run_result["stop_reason"] = _lead_target_stop_reason(ctx)
+                        break
+                continue
+
             current_signature = _follow_through_signature(ctx)
             if current_signature != last_follow_through_signature:
                 follow_through_reminders = 0
@@ -231,6 +253,26 @@ async def run_agent_loop(config: dict, source: str, ctx: ToolContext) -> dict:
                 )
             )
             break
+
+        if await _try_automatic_follow_through_actions(ctx, messages, step):
+            if _lead_target_reached(ctx):
+                print(
+                    f"\n[agent] Lead target reached after step {step} — job stopped.",
+                    flush=True,
+                )
+                run_result["status"] = "completed"
+                run_result["stop_reason"] = _lead_target_stop_reason(ctx)
+                break
+            if await _try_automatic_profile_processing(ctx, messages, step):
+                if _lead_target_reached(ctx):
+                    print(
+                        f"\n[agent] Lead target reached after step {step} — job stopped.",
+                        flush=True,
+                    )
+                    run_result["status"] = "completed"
+                    run_result["stop_reason"] = _lead_target_stop_reason(ctx)
+                    break
+            continue
 
         if await _try_automatic_profile_processing(ctx, messages, step):
             if _lead_target_reached(ctx):
@@ -804,6 +846,49 @@ async def _try_automatic_profile_processing(ctx: ToolContext, messages: list[dic
         processed_any = True
         if _lead_target_reached(ctx):
             break
+
+    return processed_any
+
+
+async def _try_automatic_follow_through_actions(
+    ctx: ToolContext,
+    messages: list[dict],
+    step: int,
+) -> bool:
+    """Advance deterministic discovery work without spending another model turn."""
+    processed_any = False
+
+    discovery_fetch_ids = [
+        fetch_id
+        for fetch_id in _unprocessed_fetch_ids(ctx)
+        if ctx.fetch_metadata.get(fetch_id, {}).get("page_kind") in {"search_results", "directory", "company_directory", "company_page"}
+    ]
+    for fetch_id in discovery_fetch_ids[:_AUTO_LIST_LINK_BATCH_SIZE]:
+        list_args = {"fetch_id": fetch_id, "limit": 10}
+        print(f"[step {step}] → list_links({_fmt_args(list_args)}) [auto]", flush=True)
+        list_result = await dispatch_tool("list_links", list_args, ctx)
+        list_result_str = json.dumps(list_result, ensure_ascii=False)
+        print(f"[step {step}] ← {list_result_str[:300]} [auto]", flush=True)
+        messages.append({"role": "tool", "content": _tool_history_content("list_links", list_result, ctx)})
+        processed_any = True
+
+    discovered_urls = _remaining_discovered_profile_urls(ctx)
+    if not discovered_urls:
+        return processed_any
+
+    remaining_gap = max(1, _lead_target(ctx) - _saved_lead_count(ctx))
+    batch_size = min(len(discovered_urls), max(_AUTO_PROFILE_BATCH_SIZE, min(_AUTO_DISCOVERY_FETCH_BATCH_SIZE, remaining_gap)))
+    for url in discovered_urls[:batch_size]:
+        fetch_args = {
+            "url": url,
+            "needs_javascript": bool(_social_platform_for_domain(_domain_for_url(url))),
+        }
+        print(f"[step {step}] → fetch_page({_fmt_args(fetch_args)}) [auto]", flush=True)
+        fetch_result = await dispatch_tool("fetch_page", fetch_args, ctx)
+        fetch_result_str = json.dumps(fetch_result, ensure_ascii=False)
+        print(f"[step {step}] ← {fetch_result_str[:300]} [auto]", flush=True)
+        messages.append({"role": "tool", "content": _tool_history_content("fetch_page", fetch_result, ctx)})
+        processed_any = True
 
     return processed_any
 
